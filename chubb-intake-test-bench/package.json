@@ -1,0 +1,9 @@
+{
+  "name": "chubb-intake-test-bench",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Classroom prototype comparing manual checklist intake with AI-drafted, human-reviewed intake on synthetic insurance submissions.",
+  "scripts": {
+    "test": "node tests/unit.test.js"
+  }
+}
