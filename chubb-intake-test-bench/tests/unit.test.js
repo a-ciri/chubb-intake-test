@@ -41,6 +41,13 @@ const t = async (name, fn) => { try { await fn(); passed++; console.log("ok  ", 
     const s = S.scoreRecord(rec, key);
     assert.strictEqual(s.missingFlagged, 0); assert.strictEqual(s.falseMissing, 1); assert.strictEqual(s.presentCorrect, 8);
   });
+  await t("all-fields-correct combines stated and missing fields over the 10 required fields", () => {
+    const key = Object.fromEntries(S.FIELDS.map(f => [f.id, null])); key.insured_name = "X Co."; key.losses_5yr = 0;
+    const rec = Object.fromEntries(S.FIELDS.flatMap(f => [[f.id, ""], [f.id + "_missing", true]]));
+    rec.insured_name = "X"; rec.insured_name_missing = false; rec.losses_5yr_missing = true;   // 1 stated right, 1 stated flagged wrongly, 8 missing flagged
+    const s = S.scoreAll([{ packet_id: "S01", arm: "A", duration_s: 10, ai_status: "n/a", ...rec }], { S01: key }).summary.A;
+    assert.strictEqual(s.overall, 9 / 10); assert.strictEqual(s.accuracy, 1 / 2); assert.strictEqual(s.recall, 1);
+  });
   await t("scoreAll separates fallback records and applies the 30% time rule", () => {
     const key = { a: 1 }; const keys = { S01: Object.fromEntries(S.FIELDS.map(f => [f.id, null])) };
     const mk = (arm, sec, status) => ({ packet_id: "S01", arm, duration_s: sec, ai_status: status, fields_changed_from_ai: 0,
@@ -57,6 +64,7 @@ const t = async (name, fn) => { try { await fn(); passed++; console.log("ok  ", 
     json: async () => ({ candidates: [{ content: { parts: [{ text: typeof payload === "string" ? payload : JSON.stringify(payload) } ] } }] }),
     text: async () => "upstream detail" });
   process.env.GEMINI_API_KEY = "test-key";
+  process.env.GEMINI_MODEL = "gemini-test-flash";   // pinned: these tests skip model discovery
 
   await t("API: valid answer is whitelisted and cleaned", async () => {
     global.fetch = gemini("```json\n" + JSON.stringify({ insured_name: "Acme Inc.", annual_revenue: 5e8, industry: "hospitality",
@@ -95,9 +103,47 @@ const t = async (name, fn) => { try { await fn(); passed++; console.log("ok  ", 
     res = mockRes(); global.fetch = gemini("not json at all"); await extract({ method: "POST", body: { packet: "x" } }, res); assert.strictEqual(res.code, 502);
     res = mockRes(); global.fetch = async () => { throw new TypeError("network"); }; await extract({ method: "POST", body: { packet: "x" } }, res); assert.strictEqual(res.code, 502);
   });
-  await t("API: health check reports key status without exposing it", async () => {
+  delete process.env.GEMINI_MODEL;   // remaining tests exercise discovery
+  await t("API: health check reports key status and model without exposing the key", async () => {
+    global.fetch = async () => ({ ok: true, json: async () => ({ models: [
+      { name: "models/gemini-3.0-flash", supportedGenerationMethods: ["generateContent"] }] }) });
     const res = mockRes(); await extract({ method: "GET" }, res);
-    assert.strictEqual(res.body.keyConfigured, true); assert.ok(!JSON.stringify(res.body).includes("test-key"));
+    assert.strictEqual(res.body.keyConfigured, true); assert.strictEqual(res.body.model, "gemini-3.0-flash");
+    assert.ok(!JSON.stringify(res.body).includes("test-key"));
+  });
+  await t("pickModel prefers the newest stable standard Flash model", () => {
+    const names = ["gemini-2.0-flash", "gemini-2.0-flash-lite", "gemini-3.0-flash", "gemini-3.0-flash-preview-0901",
+      "gemini-3.0-flash-image", "gemini-3.0-pro", "text-embedding-004", "gemma-3-27b-it"];
+    assert.strictEqual(extract.pickModel(names, ""), "gemini-3.0-flash");
+    assert.strictEqual(extract.pickModel(names, "gemini-2.0-flash"), "gemini-2.0-flash");      // valid override wins
+    assert.strictEqual(extract.pickModel(names, "gemini-9-flash"), "gemini-3.0-flash");        // invalid override ignored
+    assert.strictEqual(extract.pickModel(["gemini-3.0-flash-lite", "gemini-3.0-pro"], ""), "gemini-3.0-flash-lite");
+    assert.strictEqual(extract.pickModel(["gemini-3.0-pro"], ""), "gemini-3.0-pro");
+    assert.strictEqual(extract.pickModel([], ""), null);
+  });
+  await t("API: a retired model (404) triggers discovery and one retry with an available model", async () => {
+    const calls = [];
+    process.env.GEMINI_MODEL = "gemini-2.5-flash";
+    global.fetch = async (url) => {
+      calls.push(url);
+      if (url.includes("/models?")) return { ok: true, json: async () => ({ models: [
+        { name: "models/gemini-3.0-flash", supportedGenerationMethods: ["generateContent"] }] }) };
+      if (url.includes("gemini-2.5-flash:")) return { ok: false, status: 404, text: async () => "not found" };
+      return gemini({ insured_name: "Acme Inc." })();
+    };
+    const res = mockRes(); await extract({ method: "POST", body: { packet: "x" } }, res);
+    delete process.env.GEMINI_MODEL;
+    assert.strictEqual(res.code, 200); assert.strictEqual(res.body.model, "gemini-3.0-flash");
+    assert.ok(calls.some(u => u.includes("gemini-2.5-flash:")) && calls.some(u => u.includes("gemini-3.0-flash:")));
+  });
+  await t("API: no usable model gives a clear error", async () => {
+    const fresh = require("../api/extract.js");
+    global.fetch = async (url) => url.includes("/models?") ? { ok: true, json: async () => ({ models: [] }) }
+      : { ok: false, status: 404, text: async () => "" };
+    process.env.GEMINI_MODEL = "gemini-9-flash";
+    const res = mockRes(); await fresh({ method: "POST", body: { packet: "x" } }, res);
+    delete process.env.GEMINI_MODEL;
+    assert.strictEqual(res.code, 502); assert.ok(/model/i.test(res.body.error));
   });
   console.log(`\n${passed} tests passed`);
 })();
