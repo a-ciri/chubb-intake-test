@@ -251,7 +251,11 @@
       let d = {};
       try { d = await r.json(); } catch (_) { /* non-JSON reply */ }
       if (state.work !== w) return; // user left
-      if (!r.ok || !d.fields) throw new Error(d.error || `The AI service returned an error (${r.status}).`);
+      if (!r.ok || !d.fields) {
+        const why = Array.isArray(d.tried) && d.tried.length
+          ? ` [${d.tried.map(x => `${x.model}: ${x.status}${x.ms ? ` at ${Math.round(x.ms / 1000)}s` : ""}`).join("; ")}]` : "";
+        throw new Error((d.error || `The AI service returned an error (${r.status}).`) + why);
+      }
       w.ai = { status: "ok", draft: d.fields, latency: (performance.now() - t) / 1000, model: d.model || "" };
       fillDraft(d.fields);
     } catch (e) {
@@ -289,7 +293,7 @@
     w.els.status.className = "ai-status failed";
     w.els.status.replaceChildren(...[
       h("strong", {}, "AI draft unavailable. "), msg + " ",
-      w.mode === "session" ? "Complete this packet manually. It will be logged as a fallback. " : "Complete this packet manually. ",
+      w.mode === "session" ? "Retry, or complete this packet manually; it will be logged as a fallback. " : "Retry, or complete this packet manually. ",
       h("button", { class: "btn quiet small", type: "button", onclick: () => {
         w.els.form.querySelectorAll(".field").forEach(r => r.replaceWith(fieldRow(S.FIELDS.find(f => f.id === r.dataset.field), w)));
         w.ai.status = "pending"; w.els.saveBtn.textContent = "Approve record"; setFormDisabled(true); runAi();
