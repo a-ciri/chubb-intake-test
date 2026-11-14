@@ -137,6 +137,7 @@
       summary[g] = {
         records: items.length, ...t,
         accuracy: t.present ? t.presentCorrect / t.present : null,
+        overall: (t.present + t.missing) ? (t.presentCorrect + t.missingFlagged) / (t.present + t.missing) : null,
         recall: t.missing ? t.missingFlagged / t.missing : null,
         medianSeconds: median(items.map(({ r }) => Number(r.duration_s))),
         acceptedUnchanged: g === "B" ? items.filter(({ r }) => Number(r.fields_changed_from_ai) === 0).length : null
