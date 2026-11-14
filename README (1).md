@@ -55,7 +55,7 @@ Entry rules (shown on the home page) are the same for both arms: enter only what
 1. **Gemini key:** at [Google AI Studio](https://aistudio.google.com), choose **Get API key → Create API key**. No payment details are needed. Never put the key in a file, a screenshot or GitHub.
 2. **GitHub:** create a public repository. Click **Add file → Upload files** and drag in the *contents* of this folder (so `index.html` sits at the top level, next to the `api` and `data` folders). Commit.
 3. **Vercel:** sign in with GitHub, click **Add New → Project**, and import the repository. Framework preset: **Other**. Leave the build command empty.
-4. Before clicking **Deploy**, open **Environment Variables** and add `GEMINI_API_KEY` with your key. Optionally add `GEMINI_MODEL` (default `gemini-2.5-flash`). If the app later reports the model was not found, set `GEMINI_MODEL` to a model listed in AI Studio and redeploy.
+4. Before clicking **Deploy**, open **Environment Variables** and add `GEMINI_API_KEY` (spelled exactly) with your key. The app asks Google which models the key can use and picks the newest standard Flash model. To force one model, also add `GEMINI_MODEL` with a model ID listed in AI Studio. **Check AI connection** shows the model in use.
 5. Deploy, open the URL on a laptop and a phone, and use **Check AI connection** on the home page.
 
 Every new commit to GitHub redeploys automatically. If you add or change an environment variable after deploying, redeploy from the Vercel dashboard.
@@ -90,6 +90,7 @@ Every new commit to GitHub redeploys automatically. If you add or change an envi
 | `duration_s` | number | Seconds from Start to Save/Approve, including AI wait and review | `104.6` |
 | `ai_status` | text | `n/a` (Arm A), `ok`, or `fallback` (AI unavailable; manual entry) | `ok` |
 | `ai_latency_s` | number | Seconds the AI took to return a draft (blank for Arm A) | `3.2` |
+| `ai_model` | text | Gemini model that produced the draft (blank for Arm A and fallbacks) | `gemini-…-flash` |
 | `fields_changed_from_ai` | integer | AI values the reviewer changed before approving (blank unless `ok`) | `1` |
 | `insured_name` … `losses_5yr` | text | The 10 values entered, as typed | `412.5M` |
 | `<field>_missing` | true/false | Whether “Not in packet” was ticked | `false` |
@@ -112,4 +113,4 @@ Scoring: *all fields correct* = correct entries ÷ all required fields (10 per p
 - Packets are plain text; real submissions arrive as PDFs and spreadsheets, which would need document parsing.
 - Records live in one browser's storage. Clearing browsing data deletes them, so export after each session.
 - Answer keys are in the public repository (encoded, not secret). The test relies on the reviewer not opening them.
-- Gemini's behavior and free-tier limits can change, and the default model name may be retired.
+- Gemini's behavior and free-tier limits can change. Model names are retired often, so the app picks an available model at run time and logs the model used in every Arm B record.

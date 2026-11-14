@@ -109,7 +109,9 @@
     try {
       const r = await fetch("/api/extract", { method: "GET" });
       const d = await r.json();
-      out.textContent = d.keyConfigured ? `AI connected. Model: ${d.model}.` : "The AI function is running, but GEMINI_API_KEY is not set in Vercel.";
+      if (!d.keyConfigured) out.textContent = "The AI function is running, but GEMINI_API_KEY is not set in Vercel.";
+      else if (!d.model) out.textContent = "The key is set, but Google returned no usable model. Check the key in Google AI Studio.";
+      else out.textContent = `AI connected. Model in use: ${d.model}${d.configuredModel && d.configuredModel !== d.model ? ` (GEMINI_MODEL "${d.configuredModel}" is not available)` : ""}.`;
     } catch (_) { out.textContent = "The AI function could not be reached. On a local preview this is expected; Option B will fall back to manual entry."; }
   }
 
@@ -250,7 +252,7 @@
       try { d = await r.json(); } catch (_) { /* non-JSON reply */ }
       if (state.work !== w) return; // user left
       if (!r.ok || !d.fields) throw new Error(d.error || `The AI service returned an error (${r.status}).`);
-      w.ai = { status: "ok", draft: d.fields, latency: (performance.now() - t) / 1000, model: d.model };
+      w.ai = { status: "ok", draft: d.fields, latency: (performance.now() - t) / 1000, model: d.model || "" };
       fillDraft(d.fields);
     } catch (e) {
       if (state.work !== w) return;
@@ -285,13 +287,13 @@
     w.els.form.querySelectorAll(".review").forEach(el => el.remove());
     w.els.saveBtn.textContent = "Save record";
     w.els.status.className = "ai-status failed";
-    w.els.status.replaceChildren(
+    w.els.status.replaceChildren(...[
       h("strong", {}, "AI draft unavailable. "), msg + " ",
-      "Complete this packet manually. It will be logged as a fallback.",
+      w.mode === "session" ? "Complete this packet manually. It will be logged as a fallback. " : "Complete this packet manually. ",
       w.mode !== "practice" && h("button", { class: "btn quiet small", type: "button", onclick: () => {
         w.els.form.querySelectorAll(".field").forEach(r => r.replaceWith(fieldRow(S.FIELDS.find(f => f.id === r.dataset.field), w)));
         w.ai.status = "pending"; w.els.saveBtn.textContent = "Approve record"; setFormDisabled(true); runAi();
-      } }, "Retry AI draft"));
+      } }, "Retry AI draft")].filter(Boolean));   // fix T-D1: a skipped button printed "false"
     updateReviewCount();
   }
 
@@ -345,6 +347,7 @@
         session: w.session, packet_id: w.packet.id, arm: w.arm, started_at: w.startedAt,
         duration_s: Math.round(seconds * 10) / 10, ai_status: w.ai.status,
         ai_latency_s: w.ai.latency === null ? "" : Math.round(w.ai.latency * 10) / 10,
+        ai_model: w.ai.model || "",
         fields_changed_from_ai: changed
       };
       for (const f of S.FIELDS) { rec[f.id] = vals[f.id]; rec[f.id + "_missing"] = vals[f.id + "_missing"]; }
@@ -449,7 +452,7 @@
 
   /* ---------- data: CSV export, import, reset ---------- */
   const BASE_COLS = ["session", "packet_id", "arm", "started_at", "duration_s", "ai_status", "ai_latency_s", "fields_changed_from_ai"];
-  const COLS = [...BASE_COLS, ...S.FIELDS.flatMap(f => [f.id, f.id + "_missing"])];
+  const COLS = [...BASE_COLS, "ai_model", ...S.FIELDS.flatMap(f => [f.id, f.id + "_missing"])];
 
   function csvCell(v) {
     let s = v === null || v === undefined ? "" : String(v);
