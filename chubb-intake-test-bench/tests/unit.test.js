@@ -192,5 +192,34 @@ const t = async (name, fn) => { try { await fn(); passed++; console.log("ok  ", 
     const res = mockRes(); await extract({ method: "POST", body: { packet: "x" } }, res);
     assert.strictEqual(res.code, 502); assert.strictEqual(gen, 1); assert.ok(/403/.test(res.body.error));
   });
+  await t("thinkingConfig: low for Gemini 3+, off for 2.5 Flash, none for older models", () => {
+    assert.deepStrictEqual(extract.thinkingConfig("gemini-3.8-flash"), { thinkingLevel: "low" });
+    assert.deepStrictEqual(extract.thinkingConfig("gemini-2.5-flash"), { thinkingBudget: 0 });
+    assert.strictEqual(extract.thinkingConfig("gemini-2.5-pro"), null);
+    assert.strictEqual(extract.thinkingConfig("gemini-2.0-flash"), null);
+  });
+  await t("API: sends low thinking, and retries the same model without it if rejected (400)", async () => {
+    extract._resetCache(); const bodies = [];
+    global.fetch = async (url, opts) => {
+      if (url.includes("/models?")) return listOf("gemini-3.8-flash");
+      const b = JSON.parse(opts.body); bodies.push(b.generationConfig);
+      if (b.generationConfig.thinkingConfig) return { ok: false, status: 400, text: async () => "unknown field thinkingLevel" };
+      return gemini({ insured_name: "Acme Inc." })();
+    };
+    const res = mockRes(); await extract({ method: "POST", body: { packet: "x" } }, res);
+    assert.strictEqual(res.code, 200); assert.strictEqual(bodies.length, 2);
+    assert.deepStrictEqual(bodies[0].thinkingConfig, { thinkingLevel: "low" }); assert.ok(!("thinkingConfig" in bodies[1]));
+  });
+  await t("API: a failure reports what happened to each model", async () => {
+    extract._resetCache();
+    global.fetch = async (url) => {
+      if (url.includes("/models?")) return listOf("gemini-3.8-flash", "gemini-3.8-flash-lite");
+      if (url.includes("gemini-3.8-flash:")) { const e = new Error("aborted"); e.name = "AbortError"; throw e; }
+      return { ok: false, status: 503, text: async () => "overloaded" };
+    };
+    const res = mockRes(); await extract({ method: "POST", body: { packet: "x" } }, res);
+    assert.strictEqual(res.code, 503);
+    assert.deepStrictEqual(res.body.tried.map(x => `${x.model}:${x.status}`), ["gemini-3.8-flash:timeout", "gemini-3.8-flash-lite:503"]);
+  });
   console.log(`\n${passed} tests passed`);
 })();
