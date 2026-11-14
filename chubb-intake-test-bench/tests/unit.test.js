@@ -145,5 +145,52 @@ const t = async (name, fn) => { try { await fn(); passed++; console.log("ok  ", 
     delete process.env.GEMINI_MODEL;
     assert.strictEqual(res.code, 502); assert.ok(/model/i.test(res.body.error));
   });
+  // ---- failover across models (busy free tier)
+  const listOf = (...names) => ({ ok: true, json: async () => ({ models: names.map(n => ({ name: "models/" + n, supportedGenerationMethods: ["generateContent"] })) }) });
+  await t("rankModels orders standard Flash, then Flash-Lite, then other text models", () => {
+    assert.deepStrictEqual(extract.rankModels(["gemini-3.0-pro", "gemini-3.0-flash-lite", "gemini-3.0-flash", "gemini-2.0-flash", "gemini-3.0-flash-image"], ""),
+      ["gemini-3.0-flash", "gemini-2.0-flash", "gemini-3.0-flash-lite", "gemini-3.0-pro"]);
+  });
+  await t("API: a busy model (503) fails over to the next model and remembers it", async () => {
+    extract._resetCache(); const calls = [];
+    global.fetch = async (url) => {
+      calls.push(url);
+      if (url.includes("/models?")) return listOf("gemini-3.8-flash", "gemini-3.8-flash-lite");
+      if (url.includes("gemini-3.8-flash:")) return { ok: false, status: 503, text: async () => "overloaded" };
+      return gemini({ insured_name: "Acme Inc." })();
+    };
+    let res = mockRes(); await extract({ method: "POST", body: { packet: "x" } }, res);
+    assert.strictEqual(res.code, 200); assert.strictEqual(res.body.model, "gemini-3.8-flash-lite"); assert.strictEqual(res.body.attempts, 2);
+    calls.length = 0; res = mockRes(); await extract({ method: "POST", body: { packet: "x" } }, res);
+    assert.strictEqual(res.body.model, "gemini-3.8-flash-lite"); assert.strictEqual(calls.length, 1);   // cached: one call
+  });
+  await t("API: a slow model (timeout) fails over to the next model", async () => {
+    extract._resetCache();
+    global.fetch = async (url) => {
+      if (url.includes("/models?")) return listOf("gemini-3.8-flash", "gemini-3.8-flash-lite");
+      if (url.includes("gemini-3.8-flash:")) { const e = new Error("aborted"); e.name = "AbortError"; throw e; }
+      return gemini({ insured_name: "Acme Inc." })();
+    };
+    const res = mockRes(); await extract({ method: "POST", body: { packet: "x" } }, res);
+    assert.strictEqual(res.code, 200); assert.strictEqual(res.body.model, "gemini-3.8-flash-lite");
+  });
+  await t("API: every model busy gives a clear 503, at most 3 attempts", async () => {
+    extract._resetCache(); let gen = 0;
+    global.fetch = async (url) => {
+      if (url.includes("/models?")) return listOf("gemini-3.8-flash", "gemini-3.5-flash", "gemini-3.8-flash-lite", "gemini-3.0-pro");
+      gen++; return { ok: false, status: 503, text: async () => "overloaded" };
+    };
+    const res = mockRes(); await extract({ method: "POST", body: { packet: "x" } }, res);
+    assert.strictEqual(res.code, 503); assert.ok(/busy/.test(res.body.error) && /3 models tried/.test(res.body.error)); assert.strictEqual(gen, 3);
+  });
+  await t("API: a key or request error (400/403) is not retried on other models", async () => {
+    extract._resetCache(); let gen = 0;
+    global.fetch = async (url) => {
+      if (url.includes("/models?")) return listOf("gemini-3.8-flash", "gemini-3.8-flash-lite");
+      gen++; return { ok: false, status: 403, text: async () => "permission denied" };
+    };
+    const res = mockRes(); await extract({ method: "POST", body: { packet: "x" } }, res);
+    assert.strictEqual(res.code, 502); assert.strictEqual(gen, 1); assert.ok(/403/.test(res.body.error));
+  });
   console.log(`\n${passed} tests passed`);
 })();
