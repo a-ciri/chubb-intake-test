@@ -290,7 +290,7 @@
     w.els.status.replaceChildren(...[
       h("strong", {}, "AI draft unavailable. "), msg + " ",
       w.mode === "session" ? "Complete this packet manually. It will be logged as a fallback. " : "Complete this packet manually. ",
-      w.mode !== "practice" && h("button", { class: "btn quiet small", type: "button", onclick: () => {
+      h("button", { class: "btn quiet small", type: "button", onclick: () => {
         w.els.form.querySelectorAll(".field").forEach(r => r.replaceWith(fieldRow(S.FIELDS.find(f => f.id === r.dataset.field), w)));
         w.ai.status = "pending"; w.els.saveBtn.textContent = "Approve record"; setFormDisabled(true); runAi();
       } }, "Retry AI draft")].filter(Boolean));   // fix T-D1: a skipped button printed "false"
