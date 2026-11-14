@@ -29,8 +29,45 @@ Rules:
 - gl_occurrence_limit: the general liability each-occurrence limit in US dollars as a plain number, not the aggregate or umbrella limit.
 - losses_5yr: the number of claims in the past five years as a plain number. Use 0 only if the packet says there were no claims.`;
 
-function modelName() {
-  return (process.env.GEMINI_MODEL || "gemini-2.5-flash").trim();
+const API = "https://generativelanguage.googleapis.com/v1beta";
+let cachedModel = null;  // reused while this server instance stays warm
+
+function configuredModel() {
+  return (process.env.GEMINI_MODEL || "").trim().replace(/^models\//, "");
+}
+
+/* Models this key can call with generateContent, without the "models/" prefix. */
+async function listModels(key) {
+  const r = await fetch(`${API}/models?pageSize=1000`, { headers: { "x-goog-api-key": key } });
+  if (!r.ok) return [];
+  const d = await r.json();
+  return (d.models || [])
+    .filter(m => (m.supportedGenerationMethods || []).includes("generateContent"))
+    .map(m => String(m.name || "").replace(/^models\//, ""))
+    .filter(Boolean);
+}
+
+/* Prefer the newest stable text "flash" model; skip lite, image, audio, live and embedding variants. */
+function pickModel(names, preferred) {
+  if (preferred && names.includes(preferred)) return preferred;
+  const version = n => { const m = n.match(/gemini-(\d+(?:\.\d+)?)/); return m ? parseFloat(m[1]) : 0; };
+  const unstable = n => (/preview|exp/.test(n) ? 1 : 0);
+  const rank = list => [...list].sort((a, b) => (version(b) - version(a)) || (unstable(a) - unstable(b)) || (a.length - b.length));
+  const media = /image|tts|audio|live|embedding|vision|learnlm|gemma/;
+  const flash = names.filter(n => /^gemini-.*flash/.test(n) && !media.test(n) && !/lite/.test(n));
+  if (flash.length) return rank(flash)[0];
+  const anyFlash = names.filter(n => /^gemini-.*flash/.test(n) && !media.test(n));
+  if (anyFlash.length) return rank(anyFlash)[0];
+  const gemini = names.filter(n => /^gemini-/.test(n) && !media.test(n));
+  return gemini.length ? rank(gemini)[0] : null;
+}
+
+async function resolveModel(key, refresh) {
+  if (!refresh && cachedModel) return cachedModel;
+  if (!refresh && configuredModel()) return configuredModel();
+  const picked = pickModel(await listModels(key), refresh ? "" : configuredModel());
+  if (picked) cachedModel = picked;
+  return picked;
 }
 
 /* Accept only the expected keys, as short strings or null. Anything else is dropped. */
@@ -61,7 +98,15 @@ module.exports = async function handler(req, res) {
   res.setHeader("Cache-Control", "no-store");
 
   if (req.method === "GET") {
-    return res.status(200).json({ ok: true, model: modelName(), keyConfigured: Boolean(process.env.GEMINI_API_KEY) });
+    const key = process.env.GEMINI_API_KEY;
+    if (!key) return res.status(200).json({ ok: true, keyConfigured: false });
+    try {
+      const names = await listModels(key);
+      return res.status(200).json({ ok: true, keyConfigured: true, model: pickModel(names, configuredModel()),
+        configuredModel: configuredModel() || null });
+    } catch (_) {
+      return res.status(200).json({ ok: true, keyConfigured: true, model: null });
+    }
   }
   if (req.method !== "POST") {
     res.setHeader("Allow", "GET, POST");
@@ -81,13 +126,15 @@ module.exports = async function handler(req, res) {
     return res.status(413).json({ error: `The packet is longer than ${MAX_CHARS.toLocaleString("en-US")} characters.` });
   }
 
-  const model = modelName();
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
   const started = Date.now();
+  let model = null;
   try {
-    const r = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`,
+    model = await resolveModel(key, false);
+    if (!model) return res.status(502).json({ error: "Google returned no usable Gemini model for this API key." });
+    const call = m => fetch(
+      `${API}/models/${encodeURIComponent(m)}:generateContent`,
       {
         method: "POST",
         headers: { "Content-Type": "application/json", "x-goog-api-key": key },
@@ -102,13 +149,18 @@ module.exports = async function handler(req, res) {
         signal: controller.signal
       }
     );
+    let r = await call(model);
+    if (r.status === 404) {   // model retired or renamed: ask Google what is available and retry once
+      const next = await resolveModel(key, true);
+      if (next && next !== model) { model = next; r = await call(model); }
+    }
     if (!r.ok) {
       const detail = (await r.text()).slice(0, 300);
       if (r.status === 429) {
         return res.status(429).json({ error: "The AI free-tier rate limit was reached. Wait a minute, or continue manually." });
       }
       if (r.status === 404) {
-        return res.status(502).json({ error: `The AI model "${model}" was not found. Set GEMINI_MODEL in Vercel to a model listed in Google AI Studio.` });
+        return res.status(502).json({ error: `No available Gemini model was found (last tried "${model}"). Set GEMINI_MODEL in Vercel to a model listed in Google AI Studio.` });
       }
       return res.status(502).json({ error: `The AI service returned an error (${r.status}).`, detail });
     }
@@ -131,4 +183,5 @@ module.exports = async function handler(req, res) {
 };
 
 module.exports.sanitize = sanitize;
+module.exports.pickModel = pickModel;
 module.exports.parseModelJson = parseModelJson;
