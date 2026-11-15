@@ -114,12 +114,13 @@ const t = async (name, fn) => { try { await fn(); passed++; console.log("ok  ", 
     assert.strictEqual(res.body.keyConfigured, true); assert.strictEqual(res.body.model, "gemini-3.0-flash");
     assert.ok(!JSON.stringify(res.body).includes("test-key"));
   });
-  await t("pickModel prefers the newest stable standard Flash model", () => {
+  await t("pickModel prefers the newest stable Flash-Lite model (fastest)", () => {
     const names = ["gemini-2.0-flash", "gemini-2.0-flash-lite", "gemini-3.0-flash", "gemini-3.0-flash-preview-0901",
       "gemini-3.0-flash-image", "gemini-3.0-pro", "text-embedding-004", "gemma-3-27b-it"];
-    assert.strictEqual(extract.pickModel(names, ""), "gemini-3.0-flash");
+    assert.strictEqual(extract.pickModel(names, ""), "gemini-2.0-flash-lite");
+    assert.strictEqual(extract.pickModel(names.filter(n => !/lite/.test(n)), ""), "gemini-3.0-flash");
     assert.strictEqual(extract.pickModel(names, "gemini-2.0-flash"), "gemini-2.0-flash");      // valid override wins
-    assert.strictEqual(extract.pickModel(names, "gemini-9-flash"), "gemini-3.0-flash");        // invalid override ignored
+    assert.strictEqual(extract.pickModel(names, "gemini-9-flash"), "gemini-2.0-flash-lite");   // invalid override ignored
     assert.strictEqual(extract.pickModel(["gemini-3.0-flash-lite", "gemini-3.0-pro"], ""), "gemini-3.0-flash-lite");
     assert.strictEqual(extract.pickModel(["gemini-3.0-pro"], ""), "gemini-3.0-pro");
     assert.strictEqual(extract.pickModel([], ""), null);
@@ -150,22 +151,22 @@ const t = async (name, fn) => { try { await fn(); passed++; console.log("ok  ", 
   });
   // ---- failover across models (busy free tier)
   const listOf = (...names) => ({ ok: true, json: async () => ({ models: names.map(n => ({ name: "models/" + n, supportedGenerationMethods: ["generateContent"] })) }) });
-  await t("rankModels orders standard Flash, then Flash-Lite, then other text models", () => {
+  await t("rankModels orders Flash-Lite, then standard Flash, then other text models", () => {
     assert.deepStrictEqual(extract.rankModels(["gemini-3.0-pro", "gemini-3.0-flash-lite", "gemini-3.0-flash", "gemini-2.0-flash", "gemini-3.0-flash-image"], ""),
-      ["gemini-3.0-flash", "gemini-2.0-flash", "gemini-3.0-flash-lite", "gemini-3.0-pro"]);
+      ["gemini-3.0-flash-lite", "gemini-3.0-flash", "gemini-2.0-flash", "gemini-3.0-pro"]);
   });
   await t("API: a busy model (503) fails over to the next model and remembers it", async () => {
     extract._resetCache(); const calls = [];
     global.fetch = async (url) => {
       calls.push(url);
       if (url.includes("/models?")) return listOf("gemini-3.8-flash", "gemini-3.8-flash-lite");
-      if (url.includes("gemini-3.8-flash:")) return { ok: false, status: 503, text: async () => "overloaded" };
+      if (url.includes("gemini-3.8-flash-lite:")) return { ok: false, status: 503, text: async () => "overloaded" };
       return gemini({ insured_name: "Acme Inc." })();
     };
     let res = mockRes(); await extract({ method: "POST", body: { packet: "x" } }, res);
-    assert.strictEqual(res.code, 200); assert.strictEqual(res.body.model, "gemini-3.8-flash-lite"); assert.strictEqual(res.body.attempts, 2);
+    assert.strictEqual(res.code, 200); assert.strictEqual(res.body.model, "gemini-3.8-flash"); assert.strictEqual(res.body.attempts, 2);
     calls.length = 0; res = mockRes(); await extract({ method: "POST", body: { packet: "x" } }, res);
-    assert.strictEqual(res.body.model, "gemini-3.8-flash-lite"); assert.strictEqual(calls.length, 1);   // cached: one call
+    assert.strictEqual(res.body.model, "gemini-3.8-flash"); assert.strictEqual(calls.length, 1);   // cached: one call
   });
   await t("API: a slow model (timeout) fails over to the next model", async () => {
     extract._resetCache();
@@ -185,6 +186,16 @@ const t = async (name, fn) => { try { await fn(); passed++; console.log("ok  ", 
     };
     const res = mockRes(); await extract({ method: "POST", body: { packet: "x" } }, res);
     assert.strictEqual(res.code, 503); assert.ok(/busy/.test(res.body.error) && /3 models tried/.test(res.body.error)); assert.strictEqual(gen, 3);
+  });
+  await t("API: a rejected thinking setting is noted in the failure log", async () => {
+    extract._resetCache();
+    global.fetch = async (url, opts) => {
+      if (url.includes("/models?")) return listOf("gemini-3.8-flash-lite");
+      if (JSON.parse(opts.body).generationConfig.thinkingConfig) return { ok: false, status: 400, text: async () => "bad thinkingLevel" };
+      return { ok: false, status: 503, text: async () => "overloaded" };
+    };
+    const res = mockRes(); await extract({ method: "POST", body: { packet: "x" } }, res);
+    assert.strictEqual(res.body.tried[0].status, "503 (thinking setting rejected)");
   });
   await t("API: a key or request error (400/403) is not retried on other models", async () => {
     extract._resetCache(); let gen = 0;
@@ -221,8 +232,8 @@ const t = async (name, fn) => { try { await fn(); passed++; console.log("ok  ", 
       return { ok: false, status: 503, text: async () => "overloaded" };
     };
     const res = mockRes(); await extract({ method: "POST", body: { packet: "x" } }, res);
-    assert.strictEqual(res.code, 503);
-    assert.deepStrictEqual(res.body.tried.map(x => `${x.model}:${x.status}`), ["gemini-3.8-flash:timeout", "gemini-3.8-flash-lite:503"]);
+    assert.strictEqual(res.code, 504);   // last failure was a timeout
+    assert.deepStrictEqual(res.body.tried.map(x => `${x.model}:${x.status}`), ["gemini-3.8-flash-lite:503", "gemini-3.8-flash:timeout"]);
   });
   // ---- rule-based baseline and automatic checks
   const pk = JSON.parse(fs.readFileSync(__dirname + "/../data/packets.json", "utf8"));
