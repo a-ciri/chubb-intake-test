@@ -3,8 +3,8 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Submission intake test bench</title>
-  <meta name="description" content="Classroom prototype comparing manual checklist intake with AI-drafted, human-reviewed intake on synthetic insurance submissions.">
+  <title>Intake autopilot</title>
+  <meta name="description" content="Classroom prototype: AI extracts insurance submission fields, automatic checks accept what they can confirm and route the rest to a person.">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=Source+Serif+4:opsz,wght@8..60,400;8..60,600&display=swap" rel="stylesheet">
@@ -13,12 +13,12 @@
 <body>
   <a class="skip" href="#main">Skip to content</a>
   <header class="topbar">
-    <a class="brand" href="#home">Intake test bench</a>
+    <a class="brand" href="#home">Intake autopilot</a>
     <nav aria-label="Main">
-      <a href="#home" data-nav="home">Sessions</a>
-      <a href="#practice" data-nav="practice">Practice</a>
+      <a href="#home" data-nav="home">Overview</a>
+      <a href="#process" data-nav="process">Process a packet</a>
+      <a href="#benchmark" data-nav="benchmark">Benchmark</a>
       <a href="#try" data-nav="try">Try your own text</a>
-      <a href="#results" data-nav="results">Results</a>
       <a href="#data" data-nav="data">Data</a>
     </nav>
   </header>
@@ -29,6 +29,8 @@
     Classroom prototype for MIS 480S Project 2. All submissions are synthetic. Not affiliated with or endorsed by Chubb.
   </footer>
   <script src="scoring.js"></script>
+  <script src="rules.js"></script>
+  <script src="checks.js"></script>
   <script src="app.js"></script>
 </body>
 </html>

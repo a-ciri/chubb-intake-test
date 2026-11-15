@@ -1,116 +1,128 @@
-# Submission intake test bench
+# Intake autopilot
 
-A classroom prototype for MIS 480S Project 2. It runs the test proposed at the end of my Project 1 brief: on the same 30 synthetic commercial Package submissions, does **AI-drafted intake with human review (Option B)** match **manual checklist intake (Option A)** on accuracy and missing-field detection, while cutting handling time?
+A classroom prototype for MIS 480S Project 2. An AI reads each commercial insurance submission and fills a 10-field intake record **on its own**. Automatic checks accept the values they can confirm and send only the doubtful ones to a person (autonomy by consequence). A one-click benchmark scores three approaches on 30 labeled synthetic packets: a rule-based extractor (baseline), the AI alone, and the AI with checks.
 
-- **User:** an intake specialist or underwriter in a U.S. upper middle-market commercial insurance unit (modeled on Chubb, from public sources), turning broker emails into a triage-ready record.
+- **User:** an intake specialist in a U.S. upper middle-market commercial insurance unit (modeled on Chubb from public sources), whose work shrinks from typing every record to checking flagged fields.
 - **Live app:** _add your Vercel URL here_
 - **Data:** every packet is synthetic. No real company, broker, person or policy is described. Not affiliated with or endorsed by Chubb.
 
 ## What it does
 
-| Screen | Purpose |
+| Page | Purpose |
 | --- | --- |
-| Sessions | Runs the two timed test sessions. Session 1: S01–S15 in Arm A, S16–S30 in Arm B. Session 2 swaps the arms. |
-| Arm A | The packet sits beside a blank 10-field checklist; you fill every field yourself. |
-| Arm B | Gemini drafts the same 10 fields. Each AI value is marked “AI draft” until you review it. **Approve stays locked until every field is reviewed.** |
-| Practice | Three practice packets with answers shown after saving. P3 contains an instruction aimed at the AI (prompt-injection test). |
-| Try your own text | Paste any text and see the AI draft. Nothing is saved. |
-| Results | Reveals the hidden answer keys and scores both arms: field accuracy, missing-field recall, median time, and the Project 1 success criterion. |
-| Data | Export records as CSV, import them on another computer, or delete them. |
+| Overview | How a packet is processed, and an AI connection check |
+| Process a packet | Runs one packet: the AI drafts all fields with a source quote for each; the checks mark fields **Auto-accepted** or **Check** (with reasons); you approve after checking the flagged ones. Practice packets P1–P3 show the correct answers afterwards. |
+| Benchmark | Runs all 30 study packets through the three approaches and scores them against hidden answer keys. Can be stopped and resumed. |
+| Try your own text | Paste any text and see what the AI and checks do. Nothing is saved. |
+| Data | Download the intake log and the benchmark as CSV, or delete everything |
 
-If a Gemini model is busy (503), rate-limited, retired or slow, the function moves to the next available Flash model (up to 3 models within 28 seconds) and remembers the one that worked. If none answers, Arm B falls back to manual entry, offers **Retry AI draft**, and logs the record with `ai_status = fallback`. Fallback records are excluded from the Arm B score and counted separately.
+### The automatic checks (`checks.js`)
+
+A field is auto-accepted only if **all** of these pass. Otherwise it goes to a person, with the reasons shown:
+
+1. **Source quote found:** the line the AI quoted is actually in the packet (catches invented values).
+2. **Value in quote:** the value appears in that quote (catches values taken from the wrong place).
+3. **Valid and plausible:** the value parses and falls in a sensible range.
+4. **Not pending:** the quote doesn't say "TBD", "to follow", "same as expiring" and similar.
+5. **Independent agreement:** the rule-based reader does not find a different value. If it finds nothing, a number is accepted only when its quote contains a single number.
+6. **Packet hold:** if the packet contains instructions aimed at automated systems ("ignore previous instructions", "note for any automated system"…), every field goes to a person.
+
+If the AI is unavailable, the system stops safely: the packet opens for manual entry and **Retry AI** is offered.
 
 ## Architecture
 
 ```mermaid
 flowchart LR
-  U[Reviewer] --> UI[Web page<br/>index.html + app.js]
-  UI -->|Arm A| F[Blank checklist form]
-  UI -->|Arm B: packet text| API[/api/extract<br/>Vercel function/]
+  U[Intake specialist] --> UI[Web page<br/>app.js]
+  UI -->|packet text| API[/api/extract<br/>Vercel function/]
   API -->|key from GEMINI_API_KEY| G[Google Gemini API]
-  G -->|JSON answer| API
-  API -->|only the 10 expected fields| D[AI draft in form]
-  D --> R{Human review:<br/>every field ticked}
-  R -->|Approve| L[(Records in this<br/>browser's storage)]
-  F -->|Save| L
-  API -.->|error, timeout or rate limit| FB[Fallback: manual entry,<br/>logged as fallback]
-  FB --> L
-  L --> E[CSV export]
-  L --> S[Scoring against hidden answer keys]
+  G -->|values + source quotes| API
+  API -->|only the 10 expected fields| UI
+  UI --> RB[Rule-based reader<br/>rules.js]
+  UI --> CK{Automatic checks<br/>checks.js}
+  RB --> CK
+  CK -->|all checks pass| AA[Auto-accepted]
+  CK -->|any check fails, or packet held| HQ[Person checks flagged fields]
+  AA --> AP[Approve record]
+  HQ --> AP
+  AP --> L[(Intake log in<br/>this browser)]
+  API -.->|busy, slow or down:<br/>tries next model, then stops| FB[Safe stop: manual entry + Retry]
+  FB --> AP
+  UI --> B[Benchmark: rules vs AI vs AI + checks<br/>scored against answer keys]
+  B --> CSV[CSV export]
+  L --> CSV
 ```
 
-Logged per packet: session, packet, arm, start time, duration, AI status, AI wait time, number of AI values the reviewer changed, and the 10 entered values with their “Not in packet” flags.
+The function asks each model to think as little as possible (extraction needs no reasoning), tries the next available Gemini Flash model if one is busy, rate-limited, retired or slow (up to 3 models in 50 seconds), and returns token counts for cost.
 
-## Running the test
+## Running the benchmark
 
-1. Do practice packets P1 and P2 in each arm until the screens feel familiar.
-2. Session 1 on one day; Session 2 on a different day. Don't open `data/answer-keys.b64`.
-3. After each session, go to **Data** and click **Download records CSV**. Keep the files.
-4. After both sessions, go to **Results** and click **Score my records**. If the keys are revealed before both sessions are done, the page says so and records when it happened.
-
-Entry rules (shown on the home page) are the same for both arms: enter only what the packet states; tick “Not in packet” for TBD, to follow, to be confirmed or same as expiring; revenue is the most recent fiscal year; employees are full-time only; the GL limit is each occurrence; claims are the five-year count, with 0 only when the packet says none.
+1. Open **Benchmark** and click **Run benchmark on 30 packets**. It sends one request at a time with a short pause (Gemini free tier), so expect about 5–15 minutes. Stay on the page.
+2. If it stops (rate limit, browser closed), click **Continue**: finished packets are kept.
+3. When done, click **Download benchmark CSV** and keep the file as evidence.
 
 ## Deploy (GitHub + Vercel, free tiers)
 
-1. **Gemini key:** at [Google AI Studio](https://aistudio.google.com), choose **Get API key → Create API key**. No payment details are needed. Never put the key in a file, a screenshot or GitHub.
-2. **GitHub:** create a public repository. Click **Add file → Upload files** and drag in the *contents* of this folder (so `index.html` sits at the top level, next to the `api` and `data` folders). Commit.
-3. **Vercel:** sign in with GitHub, click **Add New → Project**, and import the repository. Framework preset: **Other**. Leave the build command empty.
-4. Before clicking **Deploy**, open **Environment Variables** and add `GEMINI_API_KEY` (spelled exactly) with your key. The app asks Google which models the key can use and picks the newest standard Flash model. To force one model, also add `GEMINI_MODEL` with a model ID listed in AI Studio. **Check AI connection** shows the model in use.
-5. Deploy, open the URL on a laptop and a phone, and use **Check AI connection** on the home page.
-
-Every new commit to GitHub redeploys automatically. If you add or change an environment variable after deploying, redeploy from the Vercel dashboard.
+1. **Gemini key:** at [Google AI Studio](https://aistudio.google.com), **Get API key → Create API key**. No payment details. Never put the key in a file, screenshot or GitHub.
+2. **GitHub:** upload the contents of this folder to a public repository.
+3. **Vercel:** import the repository (framework preset **Other**, no build command). If the files sit in a subfolder, set **Root Directory** to that folder.
+4. Add environment variable `GEMINI_API_KEY` (spelled exactly). Optional: `GEMINI_MODEL` to force one model. Redeploy after changing variables.
+5. Open the site and use **Check AI connection** on the Overview page.
 
 ## Run locally
 
-- With the AI: install Node.js, then run `npx vercel dev` in this folder (it reads the key from a local `.env` file that is git-ignored).
-- Without the AI: `python3 -m http.server` and open `http://localhost:8000`. Arm B will show the fallback, which is useful for testing it.
-- Unit tests: `node tests/unit.test.js` (no dependencies).
+- With the AI: `npx vercel dev` in this folder (reads the key from a git-ignored `.env` file).
+- Without the AI: `python3 -m http.server`; processing shows the safe-stop fallback.
+- Unit tests: `node tests/unit.test.js` (no dependencies; Gemini is mocked).
 
 ## Files
 
 | Path | What it is |
 | --- | --- |
 | `index.html`, `style.css`, `app.js` | The page, its styles and its behavior |
-| `scoring.js` | Field list, value parsing (numbers, dates, names) and scoring, shared by the page and the tests |
-| `api/extract.js` | Serverless function that calls Gemini, limits input size, treats packet text as untrusted, and returns only the 10 expected fields |
-| `data/packets.json` | 30 study packets (no answers) and 3 practice packets (with answers) |
-| `data/answer-keys.b64` | Study answer keys, base64-encoded so they are not read by accident. This is not security: anyone can decode them. |
-| `scripts/generate_packets.py` | Regenerates the packets and keys (fixed seed 480, so results are reproducible) |
-| `tests/unit.test.js` | 21 automated tests for parsing, scoring and the API function (Gemini mocked) |
+| `scoring.js` | Field list, value parsing (money, dates, names) and scoring |
+| `rules.js` | Rule-based extractor: the no-AI baseline and an independent cross-check |
+| `checks.js` | Automatic checks, packet hold and benchmark summaries |
+| `api/extract.js` | Serverless function: calls Gemini, treats packet text as untrusted, returns only the expected fields, source quotes and token usage |
+| `vercel.json` | Lets the function run up to 60 seconds |
+| `data/packets.json` | 30 study packets (20 labeled, 10 conversational) and 3 practice packets with answers |
+| `data/answer-keys.b64` | Study answer keys, base64-encoded so they are not read by accident (not security) |
+| `scripts/generate_packets.py` | Regenerates packets and keys (fixed seed 480) |
+| `tests/unit.test.js` | 32 automated tests |
 | `TESTS.md` | The eight test cases to run on the deployed site |
 
-## Data dictionary: records CSV
+## Data dictionary
 
-| Column | Type | Meaning | Example |
-| --- | --- | --- | --- |
-| `session` | integer | Test session, 1 or 2 | `1` |
-| `packet_id` | text | Study packet ID, S01–S30 | `S16` |
-| `arm` | text | `A` manual checklist, `B` AI draft with review | `B` |
-| `started_at` | ISO timestamp | When Start was clicked | `2026-11-11T19:02:44.120Z` |
-| `duration_s` | number | Seconds from Start to Save/Approve, including AI wait and review | `104.6` |
-| `ai_status` | text | `n/a` (Arm A), `ok`, or `fallback` (AI unavailable; manual entry) | `ok` |
-| `ai_latency_s` | number | Seconds the AI took to return a draft (blank for Arm A) | `3.2` |
-| `ai_model` | text | Gemini model that produced the draft (blank for Arm A and fallbacks) | `gemini-…-flash` |
-| `fields_changed_from_ai` | integer | AI values the reviewer changed before approving (blank unless `ok`) | `1` |
-| `insured_name` … `losses_5yr` | text | The 10 values entered, as typed | `412.5M` |
-| `<field>_missing` | true/false | Whether “Not in packet” was ticked | `false` |
+**Benchmark CSV** (one row per packet × field; 300 rows for a full run)
 
-The 10 fields: named insured, broker agency, requested effective date, industry (8 categories), annual revenue, full-time employees, number of locations, total insured value, GL each-occurrence limit, claims in past 5 years. **This field list is my assumption of a minimum intake checklist, not Chubb's actual intake schema.**
+| Column | Meaning | Example |
+| --- | --- | --- |
+| `packet_id`, `style` | Study packet and its style (`labeled` or `narrative`) | `S03`, `narrative` |
+| `field` | One of the 10 fields | `annual_revenue` |
+| `truth` | Correct value from the answer key, or `(not in packet)` | `772300000` |
+| `rules_value`, `rules_correct` | Rule-based value (or `(not found)`) and whether it was right | `(not found)`, `false` |
+| `ai_value`, `ai_correct` | AI value and whether it was right | `772300000`, `true` |
+| `ai_source_quote` | Text the AI says the value came from | `They closed the last fiscal year at $772.3 million…` |
+| `check_result`, `check_reasons` | `auto-accepted` or `sent to person`, with the reasons | `sent to person`, `Rule check found a different value…` |
+| `ai_model`, `ai_latency_s`, `tokens` | Model used, seconds the AI took, tokens used | `gemini-…-flash`, `6.2`, `1450` |
 
-Scoring: *all fields correct* = correct entries ÷ all required fields (10 per packet), where a stated value counts as correct when it matches the key and a missing value counts as correct when “Not in packet” is ticked. This combined figure splits into two measures that make up the Project 1 success criterion: *field accuracy* = stated values entered correctly ÷ stated values, and *missing-field recall* = missing values flagged “Not in packet” ÷ missing values. Numbers are compared after parsing (412.5M = 412,500,000), dates after normalizing to YYYY-MM-DD, and names ignoring case, punctuation and legal suffixes such as Inc. or LLC.
+**Intake log CSV** (one row per approved study packet): packet, style, time to approve, AI status and model, AI wait time, attempts, tokens, whether the packet was held, fields auto-accepted, flagged and changed by the person, and the final 10 values with their "Not in packet" flags.
+
+The 10 fields are named insured, broker agency, requested effective date, industry (8 categories), annual revenue, full-time employees, number of locations, total insured value, GL each-occurrence limit and claims in the past 5 years. **This field list is my assumption of a minimum intake checklist, not Chubb's actual schema.**
+
+**Scoring:** a stated value is correct when it matches the key after normalizing (412.5M = 412,500,000; dates to YYYY-MM-DD; names ignoring case, punctuation and legal suffixes). A missing value is correct when it is marked "Not in packet". *All fields correct* counts both, over 10 fields per packet.
 
 ## Tools
 
-- Code written with Claude (Anthropic) as an AI coding assistant, then reviewed, tested and deployed by me. See the report's prompt log and AI-use disclosure.
-- Google Gemini API (free tier) for Arm B drafts.
-- GitHub for the repository; Vercel (free tier) for hosting and the serverless function.
-- Fonts: IBM Plex Sans and Source Serif 4 (Google Fonts).
+- Code written with Claude (Anthropic) as an AI coding assistant, then deployed and tested by me. See the report's prompt log and AI-use disclosure.
+- Google Gemini API (free tier); GitHub; Vercel (free tier); IBM Plex Sans and Source Serif 4 fonts.
 
 ## Known limits
 
-- One reviewer (me) and 30 synthetic packets: the test shows whether the tool works under classroom conditions, not business impact at Chubb.
-- The same person does every packet in both arms. Reversing the arm order between sessions offsets, but does not remove, learning effects.
-- Packets are plain text; real submissions arrive as PDFs and spreadsheets, which would need document parsing.
-- Records live in one browser's storage. Clearing browsing data deletes them, so export after each session.
-- Answer keys are in the public repository (encoded, not secret). The test relies on the reviewer not opening them.
-- Gemini's behavior and free-tier limits can change. Model names are retired often, so the app picks an available model at run time and logs the model used in every Arm B record.
+- **Synthetic data, one author:** I wrote the packet generator and the rule-based extractor, so the rules' score on labeled packets is optimistic. Conversational packets are included partly to show where fixed rules break.
+- **Plain text only:** real submissions arrive as PDFs and spreadsheets, which would need document parsing first.
+- **The checks are not proof:** an AI value that is wrong but quoted correctly and unconfirmable by the rules can still be auto-accepted. The benchmark counts these as "slipped through".
+- **"Final accuracy with review" assumes reviewers are always right**; that is not measured.
+- **Free-tier dependence:** Gemini models and limits change; the model used is logged per packet.
+- Records live in one browser's storage: export after a benchmark run.
+- Answer keys sit in the public repository (encoded, not secret).

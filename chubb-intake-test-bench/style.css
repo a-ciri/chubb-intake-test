@@ -195,3 +195,36 @@ thead th { border-bottom: 2px solid var(--ink); }
   .actionbar .btn { width: 100%; }
 }
 @media (prefers-reduced-motion: reduce) { * { scroll-behavior: auto !important; transition: none !important; animation: none !important; } }
+
+/* ---------- autonomous intake ---------- */
+.page.wide { max-width: 60rem; }
+.steps { padding-left: 1.3rem; margin: 0 0 1rem; }
+.steps li { margin-bottom: .5rem; }
+.linkish { font: 600 1rem/1.2 var(--sans); color: var(--teal); background: none; border: 0; padding: 0; cursor: pointer; text-decoration: underline; }
+.packet-list { list-style: none; padding: 0; display: grid; gap: .6rem; }
+.packet-list li, .packet-grid li { display: flex; align-items: center; gap: .6rem; flex-wrap: wrap; }
+.packet-grid { list-style: none; padding: 0; display: grid; grid-template-columns: repeat(auto-fill, minmax(13rem, 1fr)); gap: .55rem 1.25rem; }
+.workbar a { color: var(--teal); }
+
+.fhead { display: flex; align-items: center; justify-content: space-between; gap: .5rem; margin-bottom: .35rem; }
+.status-tag:empty { display: none; }
+.tag.ok { background: var(--green-wash); color: var(--green); border-color: var(--green); }
+.tag.check { background: var(--amber-wash); color: var(--amber); border-color: var(--amber-line); }
+.evidence { font: italic 400 .9rem/1.45 var(--serif); color: var(--muted); margin: .4rem 0 0; overflow-wrap: anywhere; }
+.evidence:empty { display: none; }
+.evidence q { font-style: italic; }
+.reasons { margin: .35rem 0 0; padding-left: 1.1rem; font-size: .88rem; color: var(--amber); }
+.reasons:empty { display: none; }
+.review { display: flex; align-items: center; gap: .75rem; margin-top: .45rem; font-size: .92rem; }
+.review label { font-weight: 400; }
+
+.field.auto-ok { border-left-color: var(--green); }
+.field.needs-check { border-left-color: var(--amber-line); background: var(--amber-wash); }
+.field.needs-check.checked { background: transparent; border-left-color: var(--green); }
+.field.right { border-left-color: var(--green); background: transparent; }
+.field.wrong { border-left-color: var(--red); background: var(--red-wash); }
+
+.bar.wide { max-width: none; height: 8px; margin: 1rem 0 .4rem; }
+.runlog { font-size: .9rem; color: var(--muted); padding-left: 1.2rem; margin: .5rem 0 1rem; }
+td { font-variant-numeric: tabular-nums; }
+h3 { font-size: 1rem; font-weight: 600; margin: 1.75rem 0 .25rem; }

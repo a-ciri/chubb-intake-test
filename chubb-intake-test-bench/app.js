@@ -1,19 +1,20 @@
-/* Intake test bench: Option A (manual checklist) vs Option B (AI draft + human review).
-   Records are kept in this browser (localStorage) and exported as CSV. */
+/* Autonomous intake with exception routing.
+   The AI extracts every field and quotes its source; automatic checks (checks.js) accept a field or route
+   it to a person. The benchmark scores a rule-based baseline, the raw AI and the AI with checks against
+   hidden answer keys. Records stay in this browser (localStorage) and export as CSV. */
 (function () {
   "use strict";
-  const S = window.Scoring;
-  const STORE = "intake-bench-v1";
+  const S = window.Scoring, R = window.Rules, C = window.Checks;
+  const STORE = "intake-auto-v1";
   const main = document.getElementById("main");
-  const state = { packets: null, records: [], meta: {}, storageOk: true, work: null, scored: null };
+  const state = { packets: null, keys: null, log: [], bench: { results: {} }, storageOk: true, work: null, running: false, stop: false };
 
-  /* ---------- small helpers ---------- */
+  /* ---------- helpers ---------- */
   function h(tag, attrs, ...kids) {
     const el = document.createElement(tag);
     for (const [k, v] of Object.entries(attrs || {})) {
       if (v === false || v === null || v === undefined) continue;
       if (k === "class") el.className = v;
-      else if (k === "text") el.textContent = v;
       else if (k.startsWith("on")) el.addEventListener(k.slice(2), v);
       else el.setAttribute(k, v === true ? "" : v);
     }
@@ -24,133 +25,117 @@
     return el;
   }
   const fmtTime = s => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, "0")}`;
-  const pct = x => (x === null || x === undefined ? "n/a" : `${(x * 100).toFixed(1)}%`);
-  function fmtMoney(n) { return Number(n).toLocaleString("en-US"); }
+  const pct = x => (x === null || x === undefined || Number.isNaN(x) ? "n/a" : `${(x * 100).toFixed(1)}%`);
+  const fmtNum = n => Number(n).toLocaleString("en-US");
+  const sleep = ms => new Promise(r => setTimeout(r, ms));
+  const median = xs => S.median(xs.filter(x => Number.isFinite(x)));
+  const today = () => new Date().toISOString().slice(0, 10);
+  const display = (f, v) => {
+    if (v === null || v === undefined || v === "") return "Not in packet";
+    if (f.type === "text" || f.type === "industry") return String(v);   // show names exactly as extracted
+    const n = S.normalize(f, v);
+    return (f.type === "money" || f.type === "int") && typeof n === "number" ? fmtNum(n) : (n || String(v));
+  };
 
   function load() {
     try {
-      const raw = localStorage.getItem(STORE);
-      const d = raw ? JSON.parse(raw) : {};
-      state.records = Array.isArray(d.records) ? d.records : [];
-      state.meta = d.meta || {};
+      const d = JSON.parse(localStorage.getItem(STORE) || "{}");
+      state.log = Array.isArray(d.log) ? d.log : [];
+      state.bench = d.bench && d.bench.results ? d.bench : { results: {} };
     } catch (_) { state.storageOk = false; }
   }
   function save() {
-    try { localStorage.setItem(STORE, JSON.stringify({ records: state.records, meta: state.meta })); }
+    try { localStorage.setItem(STORE, JSON.stringify({ log: state.log, bench: state.bench })); }
     catch (_) { state.storageOk = false; }
   }
-
   function toast(msg) {
     const t = h("div", { class: "toast", role: "status" }, msg);
-    document.body.append(t);
-    setTimeout(() => t.remove(), 4000);
+    document.body.append(t); setTimeout(() => t.remove(), 4000);
   }
+  async function loadKeys() {
+    if (state.keys) return state.keys;
+    const r = await fetch("data/answer-keys.b64");
+    state.keys = JSON.parse(atob((await r.text()).trim()));
+    return state.keys;
+  }
+  const allPackets = () => [...state.packets.practice, ...state.packets.study];
+  const packetById = id => allPackets().find(p => p.id === id);
 
-  /* ---------- session plan ---------- */
-  // Session 1: S01-S15 in Arm A, S16-S30 in Arm B. Session 2 swaps the arms.
-  function plan(session) {
-    return state.packets.study.map((p, i) => ({ id: p.id, arm: (i < 15) === (session === 1) ? "A" : "B" }));
+  /* Call the AI function. Returns {ok, data} or {ok:false, error, status, data}. */
+  async function callAi(text) {
+    const t0 = performance.now();
+    try {
+      const r = await fetch("/api/extract", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ packet: text }) });
+      let d = {}; try { d = await r.json(); } catch (_) { /* non-JSON */ }
+      const seconds = (performance.now() - t0) / 1000;
+      if (!r.ok || !d.fields) {
+        const why = Array.isArray(d.tried) && d.tried.length
+          ? ` [${d.tried.map(x => `${x.model}: ${x.status}${x.ms ? ` at ${Math.round(x.ms / 1000)}s` : ""}`).join("; ")}]` : "";
+        return { ok: false, status: r.status, seconds, error: (d.error || `The AI service returned an error (${r.status}).`) + why };
+      }
+      return { ok: true, seconds, data: d };
+    } catch (_) {
+      return { ok: false, status: 0, seconds: (performance.now() - t0) / 1000, error: "The AI service could not be reached." };
+    }
   }
-  const findRecord = (session, id) => state.records.find(r => Number(r.session) === session && r.packet_id === id);
-  const doneCount = session => plan(session).filter(p => findRecord(session, p.id)).length;
-  const packetById = id => [...state.packets.study, ...state.packets.practice].find(p => p.id === id);
 
   /* ---------- views ---------- */
   function setView(node, title) {
-    stopTimer();
-    state.work = null;
+    stopTimer(); state.work = null;
     main.replaceChildren(node);
-    document.title = `${title} | Intake test bench`;
-    const hash = (location.hash || "#home").slice(1).split("-")[0];
-    document.querySelectorAll("[data-nav]").forEach(a =>
-      a.setAttribute("aria-current", a.dataset.nav === hash || (hash === "session" && a.dataset.nav === "home") ? "page" : "false"));
+    document.title = `${title} | Intake autopilot`;
+    const hash = (location.hash || "#home").slice(1);
+    document.querySelectorAll("[data-nav]").forEach(a => a.setAttribute("aria-current", a.dataset.nav === hash ? "page" : "false"));
     const h1 = main.querySelector("h1"); if (h1) { h1.setAttribute("tabindex", "-1"); h1.focus(); }
   }
 
   function viewHome() {
-    const sessions = [1, 2].map(n => {
-      const done = doneCount(n);
-      const arms = n === 1 ? "S01–S15 manual (A), then S16–S30 AI-assisted (B)" : "S01–S15 AI-assisted (B), then S16–S30 manual (A)";
-      return h("li", { class: "session-row" },
-        h("div", {},
-          h("h3", {}, `Session ${n}`),
-          h("p", { class: "muted" }, arms),
-          h("p", { class: "progress-text" }, `${done} of 30 packets done`),
-          h("div", { class: "bar", role: "progressbar", "aria-valuemin": "0", "aria-valuemax": "30", "aria-valuenow": String(done), "aria-label": `Session ${n} progress` },
-            h("span", { style: `width:${(done / 30) * 100}%` }))),
-        h("a", { class: "btn" + (done === 30 ? " secondary" : ""), href: `#session-${n}` },
-          done === 0 ? `Start session ${n}` : done === 30 ? `Review session ${n}` : `Continue session ${n}`));
-    });
     const health = h("p", { class: "muted", "aria-live": "polite" });
+    const done = Object.values(state.bench.results).filter(r => r.ai_status === "ok").length;
     return h("section", { class: "page" },
-      h("h1", {}, "Submission intake test bench"),
-      h("p", { class: "lede" }, "Compare manual checklist intake (Option A) with AI-drafted, human-reviewed intake (Option B) on the same 30 synthetic Package submissions. The app times each packet and scores both arms against hidden answer keys."),
-      !state.storageOk && h("p", { class: "banner error" }, "This browser is blocking local storage, so records will be lost on refresh. Export after every packet, or use another browser."),
-      h("h2", {}, "Test sessions"),
-      h("p", {}, "Run the two sessions on different days. Each packet is done once in each arm, with the order reversed between sessions to offset learning effects."),
-      h("ol", { class: "sessions" }, sessions),
-      h("h2", {}, "Entry rules for both arms"),
-      h("ul", { class: "rules" },
-        h("li", {}, "Enter only what the packet states. Don't calculate or guess."),
-        h("li", {}, "Tick “Not in packet” when a value is missing or says TBD, to follow, to be confirmed or same as expiring."),
-        h("li", {}, "Revenue means the most recent fiscal year. Employees means full-time only."),
-        h("li", {}, "GL limit means the each-occurrence limit, not the aggregate or umbrella."),
-        h("li", {}, "Claims means the count in the past five years. Enter 0 only when the packet says there were none.")),
-      h("h2", {}, "Before your first session"),
-      h("p", {}, "Try a practice packet in each arm to learn the screens. Practice packets show the answers and are never scored."),
+      h("h1", {}, "Intake autopilot"),
+      h("p", { class: "lede" }, "An AI reads each broker submission and fills the 10-field intake record on its own. Automatic checks accept the values they can confirm and send only the doubtful ones to a person."),
+      !state.storageOk && h("p", { class: "banner error" }, "This browser is blocking local storage, so results will be lost on refresh. Use another browser."),
+      h("h2", {}, "How a packet is processed"),
+      h("ol", { class: "steps" },
+        h("li", {}, h("strong", {}, "The AI extracts. "), "Gemini fills all 10 fields and quotes the line of the packet each value came from."),
+        h("li", {}, h("strong", {}, "The checks decide. "), "A value is accepted only if its quote is really in the packet, the value appears in that quote, it is plausible, and an independent rule-based reader does not disagree."),
+        h("li", {}, h("strong", {}, "A person handles the exceptions. "), "Fields that fail a check go to review with the reason. A packet with instructions aimed at the AI is held entirely. If the AI is unavailable, the packet falls back to manual entry.")),
       h("p", { class: "actions" },
-        h("a", { class: "btn secondary", href: "#practice" }, "Open practice"),
-        h("button", { class: "btn quiet", type: "button", onclick: () => checkHealth(health) }, "Check AI connection")),
+        h("a", { class: "btn", href: "#process" }, "Process a packet"),
+        h("a", { class: "btn secondary", href: "#benchmark" }, done ? `Benchmark (${done} of 30 run)` : "Run the benchmark")),
+      h("h2", {}, "The benchmark"),
+      h("p", {}, "The benchmark runs all 30 synthetic packets through three approaches and scores them against hidden answer keys: a rule-based extractor with no AI (the baseline), the AI on its own, and the AI with automatic checks."),
+      h("p", { class: "actions" }, h("button", { class: "btn quiet", type: "button", onclick: () => checkHealth(health) }, "Check AI connection")),
       health);
   }
 
   async function checkHealth(out) {
     out.textContent = "Checking…";
     try {
-      const r = await fetch("/api/extract", { method: "GET" });
-      const d = await r.json();
+      const d = await (await fetch("/api/extract", { method: "GET" })).json();
       if (!d.keyConfigured) out.textContent = "The AI function is running, but GEMINI_API_KEY is not set in Vercel.";
       else if (!d.model) out.textContent = "The key is set, but Google returned no usable model. Check the key in Google AI Studio.";
       else out.textContent = `AI connected. Model in use: ${d.model}${d.configuredModel && d.configuredModel !== d.model ? ` (GEMINI_MODEL "${d.configuredModel}" is not available)` : ""}.`;
-    } catch (_) { out.textContent = "The AI function could not be reached. On a local preview this is expected; Option B will fall back to manual entry."; }
+    } catch (_) { out.textContent = "The AI function could not be reached. On a local preview this is expected."; }
   }
 
-  function viewSession(n) {
-    const next = plan(n).find(p => !findRecord(n, p.id));
-    if (!next) {
-      return h("section", { class: "page" },
-        h("h1", {}, `Session ${n} complete`),
-        h("p", {}, n === 1
-          ? "All 30 packets are saved. Export your records on the Data page, then run Session 2 on a different day."
-          : "Both arms are done for this session. Export your records on the Data page. Score them on the Results page once both sessions are complete."),
-        h("p", { class: "actions" }, h("a", { class: "btn", href: "#data" }, "Go to Data"), h("a", { class: "btn secondary", href: "#results" }, "Go to Results")));
-    }
-    const index = plan(n).findIndex(p => p.id === next.id) + 1;
-    const isA = next.arm === "A";
-    return h("section", { class: "page start" },
-      h("p", { class: "crumb" }, `Session ${n}, packet ${index} of 30`),
-      h("h1", {}, `Packet ${next.id}`),
-      h("p", { class: "arm-chip " + (isA ? "arm-a" : "arm-b") }, isA ? "Arm A: manual checklist" : "Arm B: AI draft with your review"),
-      h("p", {}, isA
-        ? "Read the packet and fill every field yourself."
-        : "The AI fills the form first. Check each field against the packet, fix anything wrong, and tick Reviewed. You can approve only when every field is reviewed."),
-      h("p", { class: "muted" }, "The timer starts when you click Start and stops when you save. Leaving this page discards the packet in progress."),
-      h("button", { class: "btn big", type: "button", onclick: () => startWork({ mode: "session", session: n, packet: packetById(next.id), arm: next.arm, index }) }, `Start packet ${next.id}`));
-  }
-
-  function viewPractice() {
-    let arm = "A";
-    const armPick = h("fieldset", { class: "pick" }, h("legend", {}, "Arm"),
-      ["A", "B"].map(a => h("label", {},
-        h("input", { type: "radio", name: "arm", value: a, checked: a === "A", onchange: e => { arm = e.target.value; } }),
-        a === "A" ? " A: manual checklist" : " B: AI draft with your review")));
+  function viewProcess() {
+    const processed = new Set(state.log.map(r => r.packet_id));
+    const notes = { P1: "Labeled packet, nothing missing", P2: "Conversational email, two values missing", P3: "Contains an instruction aimed at the AI" };
+    const item = p => h("li", {},
+      h("button", { class: "linkish", type: "button", onclick: () => startWork(p) }, p.id),
+      h("span", { class: "tag plain" }, p.style === "narrative" ? "Conversational" : "Labeled"),
+      p.answer ? h("span", { class: "muted" }, notes[p.id] || "") : processed.has(p.id) && h("span", { class: "muted" }, "Processed"));
     return h("section", { class: "page" },
-      h("h1", {}, "Practice"),
-      h("p", { class: "lede" }, "Practice packets show the correct answers after you save. They are not timed for the study and never appear in your results."),
-      armPick,
-      h("ul", { class: "practice-list" }, state.packets.practice.map(p =>
-        h("li", {}, h("button", { class: "btn secondary", type: "button", onclick: () => startWork({ mode: "practice", packet: p, arm }) }, `Start practice packet ${p.id}`),
-          h("span", { class: "muted" }, { P1: "Complete packet", P2: "Two values missing", P3: "Contains an instruction aimed at the AI" }[p.id] || "")))));
+      h("h1", {}, "Process a packet"),
+      h("p", { class: "lede" }, "Pick a submission. The AI drafts the record, the checks accept what they can confirm, and you review only the flagged fields."),
+      h("h2", {}, "Practice packets"),
+      h("p", {}, "These show the correct answers after you approve, so you can see what the checks caught."),
+      h("ul", { class: "packet-list" }, state.packets.practice.map(item)),
+      h("h2", {}, "Study packets"),
+      h("p", {}, "These are the 30 packets used in the benchmark. Approved records are saved to the intake log on the Data page."),
+      h("ul", { class: "packet-grid" }, state.packets.study.map(item)));
   }
 
   function viewTry() {
@@ -160,30 +145,30 @@
     ta.addEventListener("input", () => { count.textContent = `${ta.value.length.toLocaleString("en-US")} of 20,000 characters`; });
     return h("section", { class: "page" },
       h("h1", {}, "Try your own text"),
-      h("p", { class: "lede" }, "Paste any submission-style text and see how the AI drafts the form. Nothing here is saved or scored."),
+      h("p", { class: "lede" }, "Paste any submission-style text and see what the AI and the checks do with it. Nothing here is saved."),
       h("p", { id: "try-warn", class: "banner" }, "Paste only synthetic or public text. Don't paste real customer or confidential information: the text is sent to Google's Gemini API."),
       h("label", { for: "try-text" }, "Submission text"), ta, count, err,
       h("button", { class: "btn", type: "button", onclick: () => {
         if (!ta.value.trim()) { err.textContent = "Paste some text first."; ta.focus(); return; }
-        startWork({ mode: "try", packet: { id: "Your text", text: ta.value, synthetic: false }, arm: "B" });
-      } }, "Draft with AI"));
+        startWork({ id: "Your text", text: ta.value, synthetic: false }, "try");
+      } }, "Process with AI"));
   }
 
   /* ---------- workspace ---------- */
   let timerId = null;
   function stopTimer() { if (timerId) { clearInterval(timerId); timerId = null; } }
 
-  function startWork(w) {
+  function startWork(packet, forceMode) {
     stopTimer();
-    w.t0 = performance.now();
-    w.startedAt = new Date().toISOString();
-    w.ai = { status: w.arm === "A" ? "n/a" : "pending", draft: null, latency: null };
-    state.work = w;
+    const mode = forceMode || (packet.answer ? "practice" : "intake");
+    state.work = { packet, mode, t0: performance.now(), startedAt: new Date().toISOString(), ai: { status: "pending" }, gate: null };
+    history.replaceState(null, "", "#work");   // its own address, so Back and the menu always navigate away
+    document.querySelectorAll("[data-nav]").forEach(a => a.setAttribute("aria-current", "false"));
     renderWorkspace();
-    if (w.arm === "B") runAi();
+    runAi();
   }
 
-  function fieldRow(f, w) {
+  function fieldRow(f) {
     const id = "f-" + f.id;
     const input = f.type === "industry"
       ? h("select", { id, name: f.id }, h("option", { value: "" }, "Choose…"), S.INDUSTRIES.map(i => h("option", { value: i }, i)))
@@ -191,347 +176,400 @@
     const nip = h("input", { type: "checkbox", class: "nip", id: id + "-nip" });
     const rev = h("input", { type: "checkbox", class: "rev", id: id + "-rev" });
     const row = h("div", { class: "field", "data-field": f.id },
-      h("label", { for: id, class: "flabel" }, f.label),
-      f.help && h("p", { class: "help" }, f.help),
+      h("div", { class: "fhead" }, h("label", { for: id, class: "flabel" }, f.label), h("span", { class: "status-tag" })),
       h("div", { class: "control" }, input, h("label", { class: "nip-label", for: id + "-nip" }, nip, " Not in packet")),
-      w.arm === "B" && h("div", { class: "review" },
-        h("span", { class: "tag" }, "AI draft"),
-        h("label", { for: id + "-rev" }, rev, " Reviewed")),
+      h("p", { class: "evidence" }),
+      h("ul", { class: "reasons" }),
+      h("div", { class: "review" }, h("label", { for: id + "-rev" }, rev, " Checked")),
       h("p", { class: "err", role: "alert" }));
-    const markTouched = () => {
-      if (w.arm === "B" && w.ai.status === "ok") { rev.checked = true; row.classList.add("reviewed"); updateReviewCount(); }
-    };
-    input.addEventListener("input", () => { row.querySelector(".err").textContent = ""; markTouched(); });
-    nip.addEventListener("change", () => { input.disabled = nip.checked; if (nip.checked) input.value = ""; row.querySelector(".err").textContent = ""; markTouched(); });
-    rev.addEventListener("change", () => { row.classList.toggle("reviewed", rev.checked); updateReviewCount(); });
+    const touched = () => { if (state.work && state.work.ai.status === "ok") { rev.checked = true; row.classList.add("checked"); updateCount(); } };
+    input.addEventListener("input", () => { row.querySelector(".err").textContent = ""; touched(); });
+    nip.addEventListener("change", () => { input.disabled = nip.checked; if (nip.checked) input.value = ""; row.querySelector(".err").textContent = ""; touched(); });
+    rev.addEventListener("change", () => { row.classList.toggle("checked", rev.checked); updateCount(); });
     return row;
   }
 
   function renderWorkspace() {
     const w = state.work;
-    const isA = w.arm === "A";
     const timer = h("span", { class: "timer", role: "timer", "aria-label": "Elapsed time" }, "0:00");
-    const status = h("div", { class: "ai-status", "aria-live": "polite" });
-    const reviewCount = h("span", { class: "review-count", "aria-live": "polite" });
-    const saveBtn = h("button", { class: "btn", type: "submit" }, isA ? "Save record" : "Approve record");
+    const status = h("div", { class: "ai-status working", "aria-live": "polite" }, "The AI is reading the packet…");
+    const count = h("span", { class: "review-count", "aria-live": "polite" });
+    const saveBtn = h("button", { class: "btn", type: "submit", disabled: true }, "Approve record");
     const form = h("form", { class: "form", novalidate: true, onsubmit: e => { e.preventDefault(); submitWork(); } },
-      status,
-      S.FIELDS.map(f => fieldRow(f, w)),
-      h("div", { class: "actionbar" }, timer, reviewCount, saveBtn));
-    const head = w.mode === "session"
-      ? [h("span", {}, `Session ${w.session}`), h("span", {}, `Packet ${w.packet.id}, ${w.index} of 30`)]
-      : [h("span", {}, w.mode === "practice" ? `Practice packet ${w.packet.id}` : "Your text")];
-    const node = h("section", { class: "work " + (isA ? "is-a" : "is-b") },
-      h("div", { class: "workbar" }, head, h("span", { class: "arm-chip " + (isA ? "arm-a" : "arm-b") }, isA ? "Arm A: manual checklist" : "Arm B: AI draft with your review")),
-      h("h1", { class: "sr-only" }, `Packet ${w.packet.id}`),
+      status, S.FIELDS.map(fieldRow), h("div", { class: "actionbar" }, timer, count, saveBtn));
+    const label = w.mode === "practice" ? `Practice packet ${w.packet.id}` : w.mode === "try" ? "Your text" : `Study packet ${w.packet.id}`;
+    main.replaceChildren(h("section", { class: "work" },
+      h("div", { class: "workbar" }, h("a", { href: w.mode === "try" ? "#try" : "#process" }, "← Back"), h("span", {}, label),
+        w.packet.style && h("span", { class: "tag plain" }, w.packet.style === "narrative" ? "Conversational" : "Labeled")),
+      h("h1", { class: "sr-only" }, label),
       h("div", { class: "split" },
         h("article", { class: "doc", "aria-label": "Submission packet" },
           h("div", { class: "doc-head" }, h("h2", {}, `Submission ${w.packet.id}`), w.packet.synthetic !== false && h("span", { class: "tag plain" }, "Synthetic")),
           h("pre", { class: "doc-text" }, w.packet.text)),
-        form));
-    main.replaceChildren(node);
-    w.els = { timer, status, reviewCount, saveBtn, form };
+        form)));
+    w.els = { timer, status, count, saveBtn, form };
     timerId = setInterval(() => { timer.textContent = fmtTime((performance.now() - w.t0) / 1000); }, 1000);
-    if (!isA) setFormDisabled(true);
-    updateReviewCount();
+    form.querySelectorAll("input, select").forEach(el => { el.disabled = true; });
     main.querySelector("h1").focus();
   }
 
-  function setFormDisabled(disabled) {
-    state.work.els.form.querySelectorAll("input, select, button").forEach(el => { el.disabled = disabled; });
-  }
+  const rowOf = id => state.work.els.form.querySelector(`[data-field="${id}"]`);
+  const inputOf = row => row.querySelector("input:not([type=checkbox]), select");
 
   async function runAi() {
     const w = state.work;
     w.els.status.className = "ai-status working";
-    w.els.status.textContent = "The AI is drafting this record…";
-    const t = performance.now();
-    try {
-      const r = await fetch("/api/extract", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ packet: w.packet.text }) });
-      let d = {};
-      try { d = await r.json(); } catch (_) { /* non-JSON reply */ }
-      if (state.work !== w) return; // user left
-      if (!r.ok || !d.fields) {
-        const why = Array.isArray(d.tried) && d.tried.length
-          ? ` [${d.tried.map(x => `${x.model}: ${x.status}${x.ms ? ` at ${Math.round(x.ms / 1000)}s` : ""}`).join("; ")}]` : "";
-        throw new Error((d.error || `The AI service returned an error (${r.status}).`) + why);
-      }
-      w.ai = { status: "ok", draft: d.fields, latency: (performance.now() - t) / 1000, model: d.model || "" };
-      fillDraft(d.fields);
-    } catch (e) {
-      if (state.work !== w) return;
-      w.ai = { status: "fallback", draft: null, latency: (performance.now() - t) / 1000, error: e.message };
-      showFallback(e.message || "The AI could not be reached.");
+    w.els.status.textContent = "The AI is reading the packet…";
+    const res = await callAi(w.packet.text);
+    if (state.work !== w) return;
+    if (!res.ok) {
+      w.ai = { status: "fallback", seconds: res.seconds, error: res.error };
+      return showFallback(res.error);
     }
+    const d = res.data;
+    w.ai = { status: "ok", seconds: res.seconds, model: d.model || "", attempts: d.attempts || 1, tokens: d.usage ? d.usage.total_tokens : "", fields: d.fields, evidence: d.evidence || {} };
+    w.rules = R.extract(w.packet.text);
+    w.gate = C.gate(w.packet.text, { fields: d.fields, evidence: d.evidence || {} }, w.rules);
+    applyGate();
   }
 
-  function fillDraft(fields) {
-    const w = state.work;
-    setFormDisabled(false);
+  function applyGate() {
+    const w = state.work, g = w.gate;
+    let review = 0;
     for (const f of S.FIELDS) {
-      const row = w.els.form.querySelector(`[data-field="${f.id}"]`);
-      const input = row.querySelector("input:not([type=checkbox]), select");
-      const nip = row.querySelector(".nip");
-      const v = fields[f.id];
-      if (v === null || v === undefined) { nip.checked = true; input.value = ""; input.disabled = true; }
-      else {
-        const n = S.normalize(f, v);
-        input.value = (f.type === "money" || f.type === "int") && typeof n === "number" ? fmtMoney(n) : (f.type === "date" && n ? n : v);
+      const row = rowOf(f.id), input = inputOf(row), nip = row.querySelector(".nip"), rev = row.querySelector(".rev");
+      const gf = g.fields[f.id];
+      row.querySelectorAll("input, select").forEach(el => { el.disabled = false; });
+      if (gf.value === null) { nip.checked = true; input.value = ""; input.disabled = true; }
+      else input.value = display(f, gf.value);
+      row.querySelector(".evidence").replaceChildren(gf.evidence ? h("span", {}, "Source: ", h("q", {}, gf.evidence)) : h("span", { class: "muted" }, "No source quoted"));
+      const tag = row.querySelector(".status-tag");
+      if (gf.status === "auto") {
+        row.classList.add("auto-ok", "checked"); rev.checked = true;
+        tag.className = "status-tag tag ok"; tag.textContent = "Auto-accepted";
+      } else {
+        review++;
+        row.classList.add("needs-check");
+        tag.className = "status-tag tag check"; tag.textContent = "Check";
+        row.querySelector(".reasons").replaceChildren(...gf.reasons.filter(r => r !== "Packet held for review").map(r => h("li", {}, r)));
       }
-      row.classList.add("ai-draft");
     }
-    w.els.status.className = "ai-status ready";
-    w.els.status.textContent = "AI draft ready. Check every field against the packet before you approve.";
-    updateReviewCount();
+    const s = w.els.status;
+    if (g.held) {
+      s.className = "ai-status failed";
+      s.replaceChildren(h("strong", {}, "Packet held. "), g.held + ". Every field needs a person's check.");
+    } else {
+      s.className = "ai-status ready";
+      s.textContent = review === 0
+        ? "All 10 fields were auto-accepted. You can approve, or open any field to change it."
+        : `${10 - review} of 10 fields auto-accepted. Check the ${review} flagged field${review === 1 ? "" : "s"} against the packet.`;
+    }
+    w.reviewNeeded = review;
+    updateCount();
   }
 
   function showFallback(msg) {
     const w = state.work;
-    setFormDisabled(false);
+    w.els.form.querySelectorAll("input, select").forEach(el => { el.disabled = false; });
     w.els.form.querySelectorAll(".review").forEach(el => el.remove());
-    w.els.saveBtn.textContent = "Save record";
+    w.els.saveBtn.textContent = "Save record"; w.els.saveBtn.disabled = false;
     w.els.status.className = "ai-status failed";
-    w.els.status.replaceChildren(...[
-      h("strong", {}, "AI draft unavailable. "), msg + " ",
-      w.mode === "session" ? "Retry, or complete this packet manually; it will be logged as a fallback. " : "Retry, or complete this packet manually. ",
-      h("button", { class: "btn quiet small", type: "button", onclick: () => {
-        w.els.form.querySelectorAll(".field").forEach(r => r.replaceWith(fieldRow(S.FIELDS.find(f => f.id === r.dataset.field), w)));
-        w.ai.status = "pending"; w.els.saveBtn.textContent = "Approve record"; setFormDisabled(true); runAi();
-      } }, "Retry AI draft")].filter(Boolean));   // fix T-D1: a skipped button printed "false"
-    updateReviewCount();
+    w.els.status.replaceChildren(h("strong", {}, "AI unavailable, so the system stopped safely. "), msg + " ",
+      "Retry, or enter this packet manually. ",
+      h("button", { class: "btn quiet small", type: "button", onclick: () => { stopTimer(); startWork(w.packet, w.mode === "try" ? "try" : undefined); } }, "Retry AI"));
+    updateCount();
   }
 
-  function updateReviewCount() {
+  function updateCount() {
     const w = state.work; if (!w || !w.els) return;
-    if (w.arm !== "B" || w.ai.status !== "ok") { w.els.reviewCount.textContent = ""; w.els.saveBtn.disabled = w.arm === "B" && w.ai.status === "pending"; return; }
-    const total = S.FIELDS.length;
-    const done = w.els.form.querySelectorAll(".rev:checked").length;
-    w.els.reviewCount.textContent = `${done} of ${total} fields reviewed`;
-    w.els.saveBtn.disabled = done < total;
+    if (w.ai.status !== "ok") { w.els.count.textContent = ""; w.els.saveBtn.disabled = w.ai.status === "pending"; return; }
+    const pending = w.els.form.querySelectorAll(".rev:not(:checked)").length;
+    w.els.count.textContent = pending ? `${pending} field${pending === 1 ? "" : "s"} left to check` : "Ready to approve";
+    w.els.saveBtn.disabled = pending > 0;
   }
 
   function readForm() {
     const vals = {};
     for (const f of S.FIELDS) {
-      const row = state.work.els.form.querySelector(`[data-field="${f.id}"]`);
-      vals[f.id] = row.querySelector("input:not([type=checkbox]), select").value.trim();
+      const row = rowOf(f.id);
+      vals[f.id] = inputOf(row).value.trim();
       vals[f.id + "_missing"] = row.querySelector(".nip").checked;
     }
     return vals;
   }
 
   function submitWork() {
-    const w = state.work;
-    const vals = readForm();
+    const w = state.work, vals = readForm();
     let firstBad = null;
     for (const f of S.FIELDS) {
-      const row = w.els.form.querySelector(`[data-field="${f.id}"]`);
-      const msg = S.validateEntry(f, vals[f.id], vals[f.id + "_missing"]);
+      const row = rowOf(f.id), msg = S.validateEntry(f, vals[f.id], vals[f.id + "_missing"]);
       row.querySelector(".err").textContent = msg;
-      if (msg && !firstBad) firstBad = row.querySelector("input:not([type=checkbox]), select");
+      if (msg && !firstBad) firstBad = inputOf(row);
     }
     if (firstBad) { firstBad.focus(); return; }
-    if (w.arm === "B" && w.ai.status === "ok" && w.els.form.querySelectorAll(".rev:not(:checked)").length) {
-      w.els.status.textContent = "Tick Reviewed on every field before you approve."; return;
-    }
     const seconds = (performance.now() - w.t0) / 1000;
     stopTimer();
-
-    let changed = "";
+    let changed = "", auto = "", review = "";
     if (w.ai.status === "ok") {
       changed = S.FIELDS.filter(f => {
-        const d = w.ai.draft[f.id]; const draftMissing = d === null || d === undefined;
-        if (draftMissing !== vals[f.id + "_missing"]) return true;
-        return !draftMissing && !S.sameValue(f, d, vals[f.id]);
+        const d = w.gate.fields[f.id].value, dm = d === null;
+        if (dm !== vals[f.id + "_missing"]) return true;
+        return !dm && !S.sameValue(f, d, vals[f.id]);
       }).length;
+      auto = S.FIELDS.filter(f => w.gate.fields[f.id].status === "auto").length;
+      review = 10 - auto;
     }
-
-    if (w.mode === "session") {
+    if (w.mode === "intake") {
       const rec = {
-        session: w.session, packet_id: w.packet.id, arm: w.arm, started_at: w.startedAt,
-        duration_s: Math.round(seconds * 10) / 10, ai_status: w.ai.status,
-        ai_latency_s: w.ai.latency === null ? "" : Math.round(w.ai.latency * 10) / 10,
-        ai_model: w.ai.model || "",
-        fields_changed_from_ai: changed
+        packet_id: w.packet.id, style: w.packet.style || "", approved_at: new Date().toISOString(),
+        duration_s: Math.round(seconds * 10) / 10, ai_status: w.ai.status, ai_model: w.ai.model || "",
+        ai_latency_s: w.ai.seconds ? Math.round(w.ai.seconds * 10) / 10 : "", ai_attempts: w.ai.attempts || "", ai_tokens: w.ai.tokens || "",
+        held: w.gate && w.gate.held ? "yes" : "no", fields_auto: auto, fields_review: review, fields_changed: changed
       };
       for (const f of S.FIELDS) { rec[f.id] = vals[f.id]; rec[f.id + "_missing"] = vals[f.id + "_missing"]; }
-      state.records = state.records.filter(r => !(Number(r.session) === w.session && r.packet_id === w.packet.id));
-      state.records.push(rec);
-      state.scored = null;
-      save();
-      toast(`Saved ${w.packet.id} (Arm ${w.arm}) in ${fmtTime(seconds)}.`);
-      setView(viewSession(w.session), `Session ${w.session}`);
+      state.log = state.log.filter(r => r.packet_id !== w.packet.id);
+      state.log.push(rec); save();
+      toast(`Approved ${w.packet.id} in ${fmtTime(seconds)}.`);
+      location.hash = "#process";
     } else if (w.mode === "practice") {
-      showPracticeFeedback(vals, seconds);
+      practiceFeedback(vals, seconds, changed);
     } else {
-      setFormDisabled(true);
+      w.els.form.querySelectorAll("input, select, button").forEach(el => { el.disabled = true; });
       w.els.status.className = "ai-status ready";
-      w.els.status.textContent = `Approved in ${fmtTime(seconds)}${changed !== "" ? `, with ${changed} of 10 AI values changed` : ""}. Text from this page is not saved.`;
+      w.els.status.textContent = `Approved in ${fmtTime(seconds)}${changed !== "" ? `; you changed ${changed} of 10 AI values` : ""}. Nothing from this page is saved.`;
     }
   }
 
-  function showPracticeFeedback(vals, seconds) {
-    const w = state.work;
-    const key = w.packet.answer;
-    const s = S.scoreRecord(vals, key);
-    setFormDisabled(true);
+  function practiceFeedback(vals, seconds, changed) {
+    const w = state.work, key = w.packet.answer;
+    const finalScore = S.scoreRecord(vals, key);
+    const aiScore = w.ai.status === "ok" ? S.scoreRecord(C.toRecord(w.ai.fields), key) : null;
+    w.els.form.querySelectorAll("input, select, button").forEach(el => { el.disabled = true; });
+    let caught = 0, slipped = 0;
     for (const f of S.FIELDS) {
-      const row = w.els.form.querySelector(`[data-field="${f.id}"]`);
-      const ok = s.perField[f.id];
-      const truth = key[f.id];
+      const row = rowOf(f.id), ok = finalScore.perField[f.id], truth = key[f.id];
       row.classList.add(ok ? "right" : "wrong");
-      row.querySelector(".err").textContent = ok ? "Correct." :
-        `Expected: ${truth === null ? "Not in packet" : (typeof truth === "number" ? fmtMoney(truth) : truth)}.`;
+      if (aiScore && !aiScore.perField[f.id]) { if (w.gate.fields[f.id].status === "review") caught++; else slipped++; }
+      row.querySelector(".err").textContent = ok ? "Correct." : `Expected: ${truth === null ? "Not in packet" : display(f, truth)}.`;
     }
+    const aiRight = aiScore ? aiScore.presentCorrect + aiScore.missingFlagged : null;
     w.els.status.className = "ai-status ready";
-    w.els.status.replaceChildren(`Practice finished in ${fmtTime(seconds)}: ${s.presentCorrect} of ${s.present} stated values right, ${s.missingFlagged} of ${s.missing} missing values flagged. `,
-      h("a", { href: "#practice", onclick: () => setTimeout(route, 0) }, "Back to practice"));
+    w.els.status.replaceChildren(
+      `Approved in ${fmtTime(seconds)}. Final record: ${finalScore.presentCorrect + finalScore.missingFlagged} of 10 correct.`,
+      aiScore ? ` The AI alone had ${aiRight} of 10 right; the checks flagged ${caught} of its ${10 - aiRight} mistake${10 - aiRight === 1 ? "" : "s"}${slipped ? ` and missed ${slipped}` : ""}.` : "",
+      " ", h("a", { href: "#process" }, "Back to packets"));
   }
 
-  /* ---------- results ---------- */
-  async function revealAndScore() {
-    try {
-      const r = await fetch("data/answer-keys.b64");
-      const keys = JSON.parse(atob((await r.text()).trim()));
-      if (!state.meta.revealedAt) {
-        state.meta.revealedAt = new Date().toISOString();
-        state.meta.recordsAtReveal = { s1: doneCount(1), s2: doneCount(2) };
-        save();
+  /* ---------- benchmark ---------- */
+  function benchItems() {
+    const keys = state.keys || {};
+    return state.packets.study.map(p => ({ p, r: state.bench.results[p.id] })).filter(x => x.r && x.r.ai_status === "ok" && keys[x.p.id]);
+  }
+
+  function computeBench() {
+    const keys = state.keys, ok = benchItems();
+    const rows = sel => ({
+      rules: C.summarize(sel.map(({ p, r }) => ({ key: keys[p.id], values: r.rules }))),
+      ai: C.summarize(sel.map(({ p, r }) => ({ key: keys[p.id], values: r.ai_fields }))),
+      gated: C.summarize(sel.map(({ p, r }) => ({ key: keys[p.id], values: r.ai_fields, gate: { fields: r.gate } })), true)
+    });
+    const all = rows(ok);
+    const byStyle = { labeled: rows(ok.filter(x => x.p.style === "labeled")), narrative: rows(ok.filter(x => x.p.style === "narrative")) };
+    const perField = S.FIELDS.map(f => {
+      let rulesOk = 0, aiOk = 0, routed = 0, slipped = 0;
+      for (const { p, r } of ok) {
+        const key = keys[p.id];
+        const rs = S.scoreRecord(C.toRecord(r.rules), key).perField[f.id];
+        const as = S.scoreRecord(C.toRecord(r.ai_fields), key).perField[f.id];
+        rulesOk += rs; aiOk += as;
+        if (r.gate[f.id].status === "review") routed++; else if (!as) slipped++;
       }
-      state.scored = { keys, ...S.scoreAll(state.records, keys) };
-    } catch (_) { toast("The answer keys could not be loaded."); }
-    route();
+      return { f, n: ok.length, rulesOk, aiOk, routed, slipped };
+    });
+    const timing = {
+      aiSeconds: median(ok.map(x => x.r.ai_latency_s)),
+      rulesMs: median(ok.map(x => x.r.rules_ms)),
+      tokens: median(ok.map(x => x.r.tokens)),
+      models: [...new Set(ok.map(x => x.r.ai_model).filter(Boolean))]
+    };
+    const failed = state.packets.study.filter(p => state.bench.results[p.id] && state.bench.results[p.id].ai_status !== "ok").length;
+    return { n: ok.length, failed, all, byStyle, perField, timing };
   }
 
-  function viewResults() {
-    const s1 = doneCount(1), s2 = doneCount(2);
-    const parts = [h("h1", {}, "Results"),
-      h("p", { class: "lede" }, `Session 1: ${s1} of 30 packets. Session 2: ${s2} of 30 packets.`)];
-    if (state.meta.revealedAt && state.meta.recordsAtReveal &&
-        (state.meta.recordsAtReveal.s1 < 30 || state.meta.recordsAtReveal.s2 < 30)) {
-      parts.push(h("p", { class: "banner" }, `The answer keys were first revealed on ${new Date(state.meta.revealedAt).toLocaleString()}, before both sessions were complete (${state.meta.recordsAtReveal.s1} and ${state.meta.recordsAtReveal.s2} of 30). Report this in your write-up.`));
+  async function runBenchmark(ui) {
+    if (state.running) return;
+    state.running = true; state.stop = false;
+    try { await loadKeys(); } catch (_) { ui.log("The answer keys could not be loaded."); state.running = false; return; }
+    if (!state.bench.startedAt) state.bench.startedAt = new Date().toISOString();
+    const todo = state.packets.study.filter(p => !(state.bench.results[p.id] && state.bench.results[p.id].ai_status === "ok"));
+    for (const p of todo) {
+      if (state.stop) { ui.log("Stopped. Click Continue to resume."); break; }
+      ui.progress();
+      const t0 = performance.now(); const rules = R.extract(p.text); const rulesMs = performance.now() - t0;
+      ui.log(`${p.id}: asking the AI…`);
+      let res = await callAi(p.text);
+      if (!res.ok && res.status === 429 && !state.stop) {
+        for (let s = 30; s > 0 && !state.stop; s--) { ui.log(`${p.id}: free-tier rate limit; waiting ${s}s…`, true); await sleep(1000); }
+        res = await callAi(p.text);
+      }
+      if (res.ok) {
+        const g = C.gate(p.text, { fields: res.data.fields, evidence: res.data.evidence || {} }, rules);
+        state.bench.results[p.id] = {
+          ai_status: "ok", ai_model: res.data.model || "", ai_attempts: res.data.attempts || 1,
+          ai_latency_s: Math.round(res.seconds * 10) / 10, rules_ms: Math.round(rulesMs * 100) / 100,
+          tokens: res.data.usage ? res.data.usage.total_tokens : null,
+          rules, ai_fields: res.data.fields, ai_evidence: res.data.evidence || {}, held: g.held,
+          gate: Object.fromEntries(S.FIELDS.map(f => [f.id, { status: g.fields[f.id].status, reasons: g.fields[f.id].reasons }]))
+        };
+        const routed = Object.values(g.fields).filter(x => x.status === "review").length;
+        ui.log(`${p.id}: done in ${res.seconds.toFixed(1)}s, ${10 - routed} auto-accepted, ${routed} flagged${g.held ? " (held)" : ""}.`);
+      } else {
+        state.bench.results[p.id] = { ai_status: "failed", error: res.error, ai_latency_s: Math.round(res.seconds * 10) / 10, rules, rules_ms: rulesMs };
+        ui.log(`${p.id}: AI failed: ${res.error}`);
+      }
+      save(); ui.progress();
+      await sleep(window.__fast ? 50 : 2500);                  // stay under free-tier request limits
     }
-    if (!state.scored) {
-      const confirm = h("div", { class: "confirm", hidden: true },
-        h("p", {}, "Scoring reveals the answer keys. Do this only after both sessions are finished, or your later answers could be influenced."),
-        h("p", { class: "actions" },
-          h("button", { class: "btn", type: "button", onclick: revealAndScore }, "Reveal keys and score"),
-          h("button", { class: "btn quiet", type: "button", onclick: () => { confirm.hidden = true; } }, "Cancel")));
-      parts.push(
-        h("p", {}, "Scoring compares your saved records with the answer keys and reports accuracy, missing-field recall and median time for each arm."),
-        h("button", { class: "btn", type: "button", disabled: state.records.length === 0, onclick: () => { confirm.hidden = false; confirm.querySelector("button").focus(); } }, "Score my records"),
-        state.records.length === 0 && h("p", { class: "muted" }, "No records yet. Start a session first."),
-        confirm);
-      return h("section", { class: "page" }, parts);
-    }
-    const { summary, detail } = state.scored;
-    const A = summary.A, B = summary.B, F = summary.B_fallback;
-    const row = (label, fa, fb, note) => h("tr", {}, h("th", { scope: "row" }, label), h("td", {}, fa), h("td", {}, fb), h("td", { class: "muted" }, note || ""));
-    parts.push(
-      h("div", { class: "table-wrap" }, h("table", {},
-        h("caption", {}, "Arm comparison on synthetic packets"),
-        h("thead", {}, h("tr", {}, h("th", { scope: "col" }, "Measure"), h("th", { scope: "col" }, "A: manual"), h("th", { scope: "col" }, "B: AI + review"), h("th", { scope: "col" }, "Notes"))),
-        h("tbody", {},
-          row("Records scored", A.records, B.records, F.records ? `${F.records} Arm B fallback record(s) excluded` : ""),
-          row("All fields correct", pct(A.overall), pct(B.overall), `Correct entries over all required fields: stated values right plus missing values flagged (${A.presentCorrect + A.missingFlagged}/${A.present + A.missing} vs ${B.presentCorrect + B.missingFlagged}/${B.present + B.missing})`),
-          row("Field accuracy", pct(A.accuracy), pct(B.accuracy), `Stated values entered correctly (${A.presentCorrect}/${A.present} vs ${B.presentCorrect}/${B.present})`),
-          row("Missing-field recall", pct(A.recall), pct(B.recall), `Missing values flagged (${A.missingFlagged}/${A.missing} vs ${B.missingFlagged}/${B.missing})`),
-          row("Stated values marked missing", A.falseMissing, B.falseMissing, "Lower is better"),
-          row("Median time per packet", A.medianSeconds === null ? "n/a" : fmtTime(A.medianSeconds), B.medianSeconds === null ? "n/a" : fmtTime(B.medianSeconds), "Arm B includes AI wait, review and corrections"),
-          row("AI drafts approved unchanged", "n/a", B.records ? `${B.acceptedUnchanged} of ${B.records}` : "n/a", "Adoption proxy for a later pilot")))));
-    if (summary.criteria) {
-      const c = summary.criteria;
-      const yes = ok => (ok ? "Met" : "Not met");
-      parts.push(h("h2", {}, "Project 1 success criterion"),
-        h("ul", { class: "rules" },
-          h("li", {}, `B accuracy at least A's: ${yes(c.accuracy)}.`),
-          h("li", {}, `B missing-field recall at least A's: ${yes(c.recall)}.`),
-          h("li", {}, `B median time at least 30% lower: ${yes(c.time)} (${(c.timeReduction * 100).toFixed(1)}% lower).`)),
-        h("p", { class: "banner " + (c.all ? "ok" : "") }, c.all ? "All three conditions are met." : "Not all conditions are met; your brief's reversal condition applies."));
-    }
-    parts.push(h("p", { class: "muted" }, "One reviewer and 30 synthetic packets show whether the tool works under test conditions. They do not show business impact at Chubb."),
-      h("p", { class: "actions" }, h("button", { class: "btn secondary", type: "button", onclick: () => downloadScored(detail) }, "Download scored CSV")));
-    return h("section", { class: "page" }, parts);
+    if (state.packets.study.every(p => state.bench.results[p.id] && state.bench.results[p.id].ai_status === "ok")) state.bench.finishedAt = new Date().toISOString();
+    save(); state.running = false; ui.done();
   }
 
-  /* ---------- data: CSV export, import, reset ---------- */
-  const BASE_COLS = ["session", "packet_id", "arm", "started_at", "duration_s", "ai_status", "ai_latency_s", "fields_changed_from_ai"];
-  const COLS = [...BASE_COLS, "ai_model", ...S.FIELDS.flatMap(f => [f.id, f.id + "_missing"])];
+  function viewBenchmark() {
+    const okCount = () => Object.values(state.bench.results).filter(r => r.ai_status === "ok").length;
+    const bar = h("span", {});
+    const progressText = h("p", { class: "progress-text" });
+    const logBox = h("ol", { class: "runlog", "aria-live": "polite" });
+    const results = h("div", {});
+    const runBtn = h("button", { class: "btn", type: "button" });
+    const stopBtn = h("button", { class: "btn secondary", type: "button", hidden: true }, "Stop");
+    const ui = {
+      log(msg, replace) {
+        if (replace && logBox.lastChild && logBox.lastChild.dataset.wait) logBox.lastChild.textContent = msg;
+        else { const li = h("li", { "data-wait": replace ? "1" : null }, msg); logBox.append(li); }
+        while (logBox.children.length > 8) logBox.firstChild.remove();
+      },
+      progress() {
+        const n = okCount();
+        progressText.textContent = `${n} of 30 packets processed by the AI${state.running ? "…" : "."}`;
+        bar.style.width = `${(n / 30) * 100}%`;
+      },
+      done() { stopBtn.hidden = true; setRunLabel(); runBtn.disabled = false; renderResults(); }
+    };
+    function setRunLabel() {
+      const n = okCount();
+      runBtn.textContent = n === 0 ? "Run benchmark on 30 packets" : n < 30 ? `Continue (${30 - n} left)` : "Benchmark complete";
+      runBtn.disabled = n === 30;
+    }
+    runBtn.addEventListener("click", () => {
+      runBtn.disabled = true; stopBtn.hidden = false;
+      runBenchmark(ui);
+    });
+    stopBtn.addEventListener("click", () => { state.stop = true; stopBtn.hidden = true; });
 
+    async function renderResults() {
+      if (okCount() === 0) { results.replaceChildren(); return; }
+      try { await loadKeys(); } catch (_) { return; }
+      const b = computeBench(), A = b.all;
+      const row = (label, r, a, g, note) => h("tr", {}, h("th", { scope: "row" }, label), h("td", {}, r), h("td", {}, a), h("td", {}, g), h("td", { class: "muted" }, note || ""));
+      const n = b.n;
+      results.replaceChildren(
+        h("h2", {}, "Results"),
+        h("p", {}, `Scored on ${n} packet${n === 1 ? "" : "s"} (${n * 10} fields) where the AI answered${b.failed ? `; ${b.failed} packet${b.failed === 1 ? "" : "s"} failed and ${b.failed === 1 ? "is" : "are"} excluded` : ""}. Model: ${b.timing.models.join(", ") || "n/a"}.`),
+        h("div", { class: "table-wrap" }, h("table", {},
+          h("caption", {}, "Three approaches on the same synthetic packets"),
+          h("thead", {}, h("tr", {}, h("th", { scope: "col" }, "Measure"), h("th", { scope: "col" }, "Rules (baseline)"), h("th", { scope: "col" }, "AI alone"), h("th", { scope: "col" }, "AI + checks"), h("th", { scope: "col" }, "Notes"))),
+          h("tbody", {},
+            row("All fields correct, no human", pct(A.rules.allFieldsCorrect), pct(A.ai.allFieldsCorrect), "n/a", "Correct values plus correctly flagged missing values"),
+            row("Stated values correct", pct(A.rules.accuracy), pct(A.ai.accuracy), "n/a", ""),
+            row("Missing values detected", pct(A.rules.recall), pct(A.ai.recall), "n/a", ""),
+            row("Fields sent to a person", "0%", "0%", pct(A.gated.reviewShare), `${A.gated.routed} of ${A.gated.fields} fields; manual entry would be 100%`),
+            row("Accuracy of fields nobody checks", pct(A.rules.allFieldsCorrect), pct(A.ai.allFieldsCorrect), pct(A.gated.acceptedAccuracy), `AI + checks: ${A.gated.acceptedCorrect} of ${A.gated.accepted} auto-accepted fields`),
+            row("AI mistakes caught by the checks", "n/a", "n/a", `${A.gated.wrongCaught} of ${A.gated.wrongCaught + A.gated.wrongSlipped}`, `${A.gated.wrongSlipped} slipped through`),
+            row("Final accuracy if reviewers fix flagged fields", "n/a", "n/a", pct(A.gated.withReview), "Assumes reviewers are always right"),
+            row("Time per packet (median)", b.timing.rulesMs === null ? "n/a" : `${b.timing.rulesMs.toFixed(1)} ms`, b.timing.aiSeconds === null ? "n/a" : `${b.timing.aiSeconds.toFixed(1)} s`, "same as AI", "AI time includes network and model wait"),
+            row("Cost per packet", "$0", b.timing.tokens ? `$0 (free tier), ${fmtNum(Math.round(b.timing.tokens))} tokens` : "$0 (free tier)", "same as AI", "Tokens shown so paid pricing can be applied"))),
+        ),
+        h("h3", {}, "By packet style"),
+        h("div", { class: "table-wrap" }, h("table", {},
+          h("thead", {}, h("tr", {}, h("th", { scope: "col" }, "Style"), h("th", { scope: "col" }, "Packets"), h("th", { scope: "col" }, "Rules: all correct"), h("th", { scope: "col" }, "AI alone: all correct"), h("th", { scope: "col" }, "Sent to a person"), h("th", { scope: "col" }, "Accuracy nobody checks"))),
+          h("tbody", {}, ["labeled", "narrative"].map(st => {
+            const x = b.byStyle[st];
+            return h("tr", {}, h("th", { scope: "row" }, st === "labeled" ? "Labeled" : "Conversational"), h("td", {}, x.rules.packets),
+              h("td", {}, pct(x.rules.allFieldsCorrect)), h("td", {}, pct(x.ai.allFieldsCorrect)), h("td", {}, pct(x.gated.reviewShare)), h("td", {}, pct(x.gated.acceptedAccuracy)));
+          })))),
+        h("h3", {}, "By field"),
+        h("div", { class: "table-wrap" }, h("table", {},
+          h("thead", {}, h("tr", {}, h("th", { scope: "col" }, "Field"), h("th", { scope: "col" }, "Rules correct"), h("th", { scope: "col" }, "AI correct"), h("th", { scope: "col" }, "Sent to a person"), h("th", { scope: "col" }, "AI errors that slipped through"))),
+          h("tbody", {}, b.perField.map(x => h("tr", {}, h("th", { scope: "row" }, x.f.label),
+            h("td", {}, `${x.rulesOk} of ${x.n}`), h("td", {}, `${x.aiOk} of ${x.n}`), h("td", {}, `${x.routed} of ${x.n}`), h("td", {}, x.slipped)))))),
+        h("p", { class: "muted" }, "Synthetic packets written for this test. The rule-based extractor and the packets share an author, so its labeled-packet score is optimistic. Results show how the approaches behave on these packets, not business impact at Chubb."),
+        h("p", { class: "actions" }, h("button", { class: "btn secondary", type: "button", onclick: downloadBench }, "Download benchmark CSV")));
+    }
+
+    setRunLabel(); ui.progress(); renderResults();
+    return h("section", { class: "page wide" },
+      h("h1", {}, "Benchmark"),
+      h("p", { class: "lede" }, "Runs all 30 synthetic packets through the rule-based baseline, the AI on its own and the AI with automatic checks, then scores each against the answer keys."),
+      h("p", {}, "It sends one request at a time with a short pause to stay within Gemini's free tier, so expect about 5–15 minutes. You can stop and continue later; finished packets are kept in this browser."),
+      h("p", { class: "actions" }, runBtn, stopBtn),
+      h("div", { class: "bar wide", role: "progressbar", "aria-label": "Benchmark progress" }, bar), progressText, logBox,
+      results);
+  }
+
+  /* ---------- data ---------- */
   function csvCell(v) {
     let s = v === null || v === undefined ? "" : String(v);
     if (/^[=+\-@\t\r]/.test(s) && !/^-?\d/.test(s)) s = "'" + s;   // block spreadsheet formula injection
     return /[",\n\r]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
   }
-  function toCSV(rows, cols) { return [cols.join(","), ...rows.map(r => cols.map(c => csvCell(r[c])).join(","))].join("\r\n"); }
-  function parseCSV(text) {
-    const rows = []; let row = [], cell = "", q = false;
-    for (let i = 0; i < text.length; i++) {
-      const ch = text[i];
-      if (q) { if (ch === '"') { if (text[i + 1] === '"') { cell += '"'; i++; } else q = false; } else cell += ch; }
-      else if (ch === '"') q = true;
-      else if (ch === ",") { row.push(cell); cell = ""; }
-      else if (ch === "\n" || ch === "\r") { if (ch === "\r" && text[i + 1] === "\n") i++; row.push(cell); rows.push(row); row = []; cell = ""; }
-      else cell += ch;
-    }
-    if (cell !== "" || row.length) { row.push(cell); rows.push(row); }
-    return rows.filter(r => r.length > 1);
-  }
+  const toCSV = (rows, cols) => [cols.join(","), ...rows.map(r => cols.map(c => csvCell(r[c])).join(","))].join("\r\n");
   function download(name, text) {
     const a = h("a", { href: URL.createObjectURL(new Blob([text], { type: "text/csv" })), download: name });
     document.body.append(a); a.click(); a.remove();
   }
-  const today = () => new Date().toISOString().slice(0, 10);
+  const LOG_COLS = ["packet_id", "style", "approved_at", "duration_s", "ai_status", "ai_model", "ai_latency_s", "ai_attempts", "ai_tokens", "held", "fields_auto", "fields_review", "fields_changed", ...S.FIELDS.flatMap(f => [f.id, f.id + "_missing"])];
+  const BENCH_COLS = ["packet_id", "style", "field", "truth", "rules_value", "rules_correct", "ai_value", "ai_correct", "ai_source_quote", "check_result", "check_reasons", "ai_model", "ai_latency_s", "tokens"];
 
-  function downloadScored(detail) {
-    const rows = detail.map(({ r, s }) => {
-      const o = { ...r, fields_correct: s.presentCorrect + s.missingFlagged, present: s.present, present_correct: s.presentCorrect, missing: s.missing, missing_flagged: s.missingFlagged, false_missing: s.falseMissing };
-      for (const f of S.FIELDS) o[f.id + "_correct"] = s.perField[f.id];
-      return o;
-    });
-    const cols = [...COLS, "fields_correct", "present", "present_correct", "missing", "missing_flagged", "false_missing", ...S.FIELDS.map(f => f.id + "_correct")];
-    download(`intake-scored-${today()}.csv`, toCSV(rows, cols));
+  async function downloadBench() {
+    await loadKeys();
+    const rows = [];
+    for (const p of state.packets.study) {
+      const r = state.bench.results[p.id]; if (!r || r.ai_status !== "ok") continue;
+      const key = state.keys[p.id];
+      const rs = S.scoreRecord(C.toRecord(r.rules), key).perField, as = S.scoreRecord(C.toRecord(r.ai_fields), key).perField;
+      for (const f of S.FIELDS) rows.push({
+        packet_id: p.id, style: p.style, field: f.id, truth: key[f.id] === null ? "(not in packet)" : key[f.id],
+        rules_value: r.rules[f.id] === null ? "(not found)" : r.rules[f.id], rules_correct: rs[f.id],
+        ai_value: r.ai_fields[f.id] === null ? "(not in packet)" : r.ai_fields[f.id], ai_correct: as[f.id],
+        ai_source_quote: r.ai_evidence[f.id] || "", check_result: r.gate[f.id].status === "auto" ? "auto-accepted" : "sent to person",
+        check_reasons: r.gate[f.id].reasons.join("; "), ai_model: r.ai_model, ai_latency_s: r.ai_latency_s, tokens: r.tokens
+      });
+    }
+    download(`benchmark-${today()}.csv`, toCSV(rows, BENCH_COLS));
   }
 
   function viewData() {
     const msg = h("p", { "aria-live": "polite" });
-    const file = h("input", { type: "file", accept: ".csv,text/csv", id: "import-file" });
     const confirmBox = h("input", { type: "text", id: "reset-confirm", autocomplete: "off" });
+    const benchN = Object.values(state.bench.results).filter(r => r.ai_status === "ok").length;
     return h("section", { class: "page" },
       h("h1", {}, "Data"),
-      h("p", { class: "lede" }, `${state.records.length} record(s) saved in this browser.`),
-      h("p", {}, "Records stay in this browser. Nothing is uploaded except the packet text sent to the AI in Arm B. Records hold no personal information: only session, packet, arm, times and the values you entered."),
-      h("h2", {}, "Export"),
-      h("p", {}, "Download your records after each session and keep the file as your evidence."),
-      h("button", { class: "btn", type: "button", disabled: state.records.length === 0, onclick: () => download(`intake-records-${today()}.csv`, toCSV(state.records, COLS)) }, "Download records CSV"),
-      h("h2", {}, "Import"),
-      h("p", {}, "Moving to another computer? Import a records CSV exported from this app. Records for the same session and packet are replaced."),
-      h("label", { for: "import-file" }, "Records CSV"), file,
-      h("button", { class: "btn secondary", type: "button", onclick: async () => {
-        if (!file.files[0]) { msg.textContent = "Choose a CSV file first."; return; }
-        const rows = parseCSV(await file.files[0].text());
-        const header = rows.shift() || [];
-        if (!BASE_COLS.every(c => header.includes(c))) { msg.textContent = "This file is not a records CSV from this app."; return; }
-        let n = 0;
-        for (const cells of rows) {
-          const r = {}; header.forEach((c, i) => { if (COLS.includes(c)) r[c] = cells[i] === undefined ? "" : cells[i].replace(/^'/, ""); });
-          if (!["1", "2"].includes(String(r.session)) || !/^S\d\d$/.test(r.packet_id) || !["A", "B"].includes(r.arm)) continue;
-          r.session = Number(r.session);
-          for (const f of S.FIELDS) r[f.id + "_missing"] = r[f.id + "_missing"] === "true";
-          state.records = state.records.filter(x => !(Number(x.session) === r.session && x.packet_id === r.packet_id));
-          state.records.push(r); n++;
-        }
-        save(); state.scored = null;
-        msg.textContent = `Imported ${n} record(s).`;
-      } }, "Import CSV"),
-      h("h2", {}, "Delete all records"),
-      h("p", {}, "This can't be undone. Type DELETE to confirm."),
+      h("p", { class: "lede" }, `${state.log.length} approved record(s) in the intake log. ${benchN} of 30 packets in the benchmark.`),
+      h("p", {}, "Everything stays in this browser. The only data sent anywhere is packet text, to Google's Gemini API. Records hold no personal information."),
+      h("h2", {}, "Intake log"),
+      h("p", {}, "One row per approved study packet: timing, AI status and model, how many fields were auto-accepted, flagged and changed, and the final values."),
+      h("button", { class: "btn", type: "button", disabled: state.log.length === 0, onclick: () => download(`intake-log-${today()}.csv`, toCSV(state.log, LOG_COLS)) }, "Download intake log CSV"),
+      h("h2", {}, "Benchmark"),
+      h("p", {}, "One row per packet and field: the correct value, the rule-based and AI values, the AI's source quote, and whether the checks accepted the field or sent it to a person, with reasons."),
+      h("button", { class: "btn", type: "button", disabled: benchN === 0, onclick: downloadBench }, "Download benchmark CSV"),
+      h("h2", {}, "Delete everything"),
+      h("p", {}, "Deletes the intake log and the benchmark results from this browser. This can't be undone. Type DELETE to confirm."),
       h("label", { for: "reset-confirm" }, "Confirmation"), confirmBox,
       h("button", { class: "btn danger", type: "button", onclick: () => {
         if (confirmBox.value.trim() !== "DELETE") { msg.textContent = "Type DELETE in the box to confirm."; confirmBox.focus(); return; }
-        state.records = []; state.meta = {}; state.scored = null; save();
-        msg.textContent = "All records deleted."; confirmBox.value = "";
-      } }, "Delete all records"),
+        state.log = []; state.bench = { results: {} }; save();
+        msg.textContent = "Everything deleted."; confirmBox.value = "";
+      } }, "Delete everything"),
       msg);
   }
 
@@ -539,19 +577,18 @@
   function route() {
     if (!state.packets) return;
     const hash = (location.hash || "#home").slice(1);
-    if (hash === "session-1" || hash === "session-2") return setView(viewSession(Number(hash.slice(-1))), `Session ${hash.slice(-1)}`);
-    if (hash === "practice") return setView(viewPractice(), "Practice");
+    if (hash === "process" || hash === "work") return setView(viewProcess(), "Process a packet");
+    if (hash === "benchmark") return setView(viewBenchmark(), "Benchmark");
     if (hash === "try") return setView(viewTry(), "Try your own text");
-    if (hash === "results") return setView(viewResults(), "Results");
     if (hash === "data") return setView(viewData(), "Data");
-    return setView(viewHome(), "Sessions");
+    return setView(viewHome(), "Overview");
   }
 
-  window.addEventListener("hashchange", route);
+  window.addEventListener("hashchange", () => { if (!state.running) route(); else if (location.hash !== "#benchmark") { toast("The benchmark keeps running on this page. Stop it first to leave."); location.hash = "#benchmark"; } });
   document.querySelectorAll("[data-nav]").forEach(a => a.addEventListener("click", () => {
-    if (location.hash === a.getAttribute("href")) setTimeout(route, 0);
+    if (location.hash === a.getAttribute("href") && !state.running) setTimeout(route, 0);
   }));
-  window.addEventListener("beforeunload", e => { if (state.work && timerId) { e.preventDefault(); e.returnValue = ""; } });
+  window.addEventListener("beforeunload", e => { if (state.running || (state.work && timerId)) { e.preventDefault(); e.returnValue = ""; } });
 
   load();
   fetch("data/packets.json")
