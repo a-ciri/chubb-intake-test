@@ -3,7 +3,8 @@
 A classroom prototype for MIS 480S Project 2. An AI reads each commercial insurance submission and fills a 10-field intake record **on its own**. Automatic checks accept the values they can confirm and send only the doubtful ones to a person (autonomy by consequence). A one-click benchmark scores three approaches on 30 labeled synthetic packets: a rule-based extractor (baseline), the AI alone, and the AI with checks.
 
 - **User:** an intake specialist in a U.S. upper middle-market commercial insurance unit (modeled on Chubb from public sources), whose work shrinks from typing every record to checking flagged fields.
-- **Live app:** _add your Vercel URL here_
+- **Live app:** https://chubb-intake-test.vercel.app
+- **Repository:** https://github.com/a-ciri/chubb-intake-test (app files are in the `chubb-intake-test-bench` folder, which is Vercel's Root Directory)
 - **Data:** every packet is synthetic. No real company, broker, person or policy is described. Not affiliated with or endorsed by Chubb.
 
 ## What it does
@@ -55,9 +56,23 @@ flowchart LR
 
 The function asks each model to think as little as possible (extraction needs no reasoning), tries the next available Gemini Flash model if one is busy, rate-limited, retired or slow (up to 3 models in 50 seconds), and returns token counts for cost.
 
+## Results (benchmark run 2, November 15, 2026)
+
+30 synthetic packets, 300 fields, gemini-3.5-flash-lite.
+
+| Measure | Rule baseline | AI alone | AI + checks |
+| --- | --- | --- | --- |
+| Fields correct, of 300 | 223 (74.3%) | 300 | 300 |
+| Conversational packets, of 100 fields | 23 | 100 | 100 |
+| Missing values flagged, of 39 | 39 | 39 | 39 |
+| Fields sent to a person | 116 | none | 34 (11.3%) |
+| Auto-accepted fields that were wrong | n/a | n/a | 0 of 266 |
+
+Run 1 gave the same AI value in all 300 fields. All 34 flagged fields were correct (false alarms), all from conversational packets. Zero errors in 300 fields still allows a true error rate of up to about 1% per field (rule of three), so the recommended release is a monitored pilot, not full autonomy. All eight live tests passed: see `TESTS.md`.
+
 ## Running the benchmark
 
-1. Open **Benchmark** and click **Run benchmark on 30 packets**. It sends one request at a time with a short pause (Gemini free tier), so expect about 5–15 minutes. Stay on the page.
+1. Open **Benchmark** and click **Run benchmark on 30 packets**. It sends one request at a time with a short pause (Gemini free tier), so a full run took about 2 minutes on Flash-Lite (longer if a model is busy). Stay on the page.
 2. If it stops (rate limit, browser closed), click **Continue**: finished packets are kept.
 3. When done, click **Download benchmark CSV** and keep the file as evidence.
 
@@ -88,8 +103,8 @@ The function asks each model to think as little as possible (extraction needs no
 | `data/packets.json` | 30 study packets (20 labeled, 10 conversational) and 3 practice packets with answers |
 | `data/answer-keys.b64` | Study answer keys, base64-encoded so they are not read by accident (not security) |
 | `scripts/generate_packets.py` | Regenerates packets and keys (fixed seed 480) |
-| `tests/unit.test.js` | 32 automated tests |
-| `TESTS.md` | The eight test cases to run on the deployed site |
+| `tests/unit.test.js` | 34 automated tests |
+| `TESTS.md` | The eight live tests with their results, and the D2 defect fix |
 
 ## Data dictionary
 
