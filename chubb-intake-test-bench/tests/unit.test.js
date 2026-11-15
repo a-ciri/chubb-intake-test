@@ -277,6 +277,13 @@ const t = async (name, fn) => { try { await fn(); passed++; console.log("ok  ", 
     const txt = "Employees: 1,240 to be confirmed"; const f = { fields: { employee_count: "1240" }, evidence: { employee_count: "Employees: 1,240 to be confirmed" } };
     assert.strictEqual(Checks.gate(txt, f, {}).fields.employee_count.status, "review");
   });
+  await t("checks (D2 retest): 'No claims reported' supports a value of 0", () => {
+    const txt = "No claims reported in the past five years (loss runs valued 9/30/2026).";
+    const g = Checks.gate(txt, { fields: { losses_5yr: "0" }, evidence: { losses_5yr: txt } }, { losses_5yr: "0" });
+    assert.strictEqual(g.fields.losses_5yr.status, "auto");
+    const g2 = Checks.gate(txt, { fields: { losses_5yr: "3" }, evidence: { losses_5yr: txt } }, { losses_5yr: "0" });
+    assert.strictEqual(g2.fields.losses_5yr.status, "review");
+  });
   await t("checks: summarize counts caught and slipped mistakes", () => {
     const key = Object.fromEntries(S.FIELDS.map(f => [f.id, null])); key.location_count = 6; key.annual_revenue = 412500000;
     const values = Object.fromEntries(S.FIELDS.map(f => [f.id, null])); values.location_count = "7"; values.annual_revenue = "999";
