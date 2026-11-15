@@ -10,7 +10,7 @@ const INDUSTRIES = ["Industrial manufacturing", "Wholesale distribution", "Const
   "Commercial real estate"];
 const MAX_CHARS = 20000;
 const TOTAL_MS = 50000;      // whole request budget (vercel.json allows the function 60 s)
-const ATTEMPT_MS = 25000;    // one model call
+const ATTEMPT_MS = 22000;    // one model call (leaves room for two more within the budget)
 const MAX_ATTEMPTS = 3;
 const RETRYABLE = new Set([404, 429, 500, 502, 503, 504]);
 
@@ -52,8 +52,8 @@ async function listModels(key) {
     .filter(Boolean);
 }
 
-/* Candidate models in order: a valid GEMINI_MODEL first, then standard Flash (newest, stable first),
-   then Flash-Lite, then other text Gemini models. Image, audio, live and embedding models are skipped. */
+/* Candidate models in order: a valid GEMINI_MODEL first, then Flash-Lite (fastest; extraction needs
+   little reasoning), then standard Flash, then other text Gemini models (newest, stable first). Image, audio, live and embedding models are skipped. */
 const version = n => { const m = String(n).match(/gemini-(\d+(?:\.\d+)?)/); return m ? parseFloat(m[1]) : 0; };
 
 /* Extraction needs little reasoning, so ask "thinking" models to think as little as possible.
@@ -73,7 +73,7 @@ function rankModels(names, preferred) {
   const flash = text.filter(n => /flash/.test(n) && !/lite/.test(n));
   const lite = text.filter(n => /flash/.test(n) && /lite/.test(n));
   const other = text.filter(n => !/flash/.test(n));
-  const ordered = [...rank(flash), ...rank(lite), ...rank(other)];
+  const ordered = [...rank(lite), ...rank(flash), ...rank(other)];
   if (preferred && names.includes(preferred)) return [preferred, ...ordered.filter(n => n !== preferred)];
   return ordered;
 }
@@ -186,14 +186,16 @@ module.exports = async function handler(req, res) {
     tried.push(model);
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), Math.min(ATTEMPT_MS, remaining));
+    let plain = false;
     try {
       let r = await call(model, controller.signal, true);
       if (r.status === 400 && thinkingConfig(model)) {   // model rejected the thinking setting: retry it plainly
+        plain = true;
         r = await call(model, controller.signal, false);
       }
       if (!r.ok) {
         if (cachedModel === model) cachedModel = null;
-        log.push({ model, status: r.status, ms: Date.now() - started });
+        log.push({ model, status: r.status + (plain ? " (thinking setting rejected)" : ""), ms: Date.now() - started });
         if (RETRYABLE.has(r.status)) { last = { model, status: r.status }; continue; }
         const detail = (await r.text()).slice(0, 300);
         return res.status(502).json({ error: `The AI service returned an error (${r.status}).`, detail, model, tried: log });
@@ -212,7 +214,7 @@ module.exports = async function handler(req, res) {
     } catch (e) {
       if (cachedModel === model) cachedModel = null;
       last = { model, status: e && e.name === "AbortError" ? "timeout" : "network" };
-      log.push({ model, status: last.status, ms: Date.now() - started });
+      log.push({ model, status: last.status + (plain ? " (thinking setting rejected)" : ""), ms: Date.now() - started });
     } finally {
       clearTimeout(timer);
     }
