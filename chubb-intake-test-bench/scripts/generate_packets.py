@@ -85,7 +85,7 @@ def fmt_limit(v):
     return f"${v:,.0f}" if rng.random() < 0.5 else f"${v // 1_000_000}M"
 
 
-def make_packet(pid, used_roots, n_missing=None, injection=False):
+def make_packet(pid, used_roots, n_missing=None, injection=False, style="labeled"):
     industry = rng.choice(list(INDUSTRIES))
     desc, tails = rng.choice(INDUSTRIES[industry])
     root = rng.choice([r for r in ROOTS if r not in used_roots]); used_roots.add(root)
@@ -116,6 +116,10 @@ def make_packet(pid, used_roots, n_missing=None, injection=False):
            "losses_5yr": losses}
     for f in missing:
         key[f] = None
+
+    if style == "narrative":
+        return narrative_packet(name, desc, state, agency, broker, eff, revenue, prior_rev, employees, seasonal,
+                                locations, tiv, gl, umbrella, losses, missing), key
 
     # ---- email body
     first = broker.split()[0]
@@ -206,18 +210,77 @@ def make_packet(pid, used_roots, n_missing=None, injection=False):
     return text, key
 
 
+def narrative_packet(name, desc, state, agency, broker, eff, revenue, prior_rev, employees, seasonal,
+                     locations, tiv, gl, umbrella, losses, missing):
+    """A conversational broker email with no labeled fields, the way many real submissions read."""
+    first = broker.split()[0]
+    article = "an" if desc[0] in "aeiou" else "a"
+    m = lambda v: fmt_money(v, rng.choice([0, 0, 2, 3]))
+    s = []
+    if "annual_revenue" in missing:
+        s.append(rng.choice(["We're still waiting on their year-end financials, so I can't give you a sales figure yet.",
+                             "Revenue numbers are with their accountant and will follow."]))
+    else:
+        s.append(rng.choice([f"Sales came in around {m(revenue)} for the last fiscal year (the year before was {fmt_money(prior_rev, 0)}).",
+                             f"They closed the last fiscal year at {m(revenue)} in revenue.",
+                             f"Top line is {m(revenue)} for the latest fiscal year, up from {fmt_money(prior_rev, 0)}."]))
+    if "employee_count" in missing:
+        s.append("I don't have a firm headcount yet; the client is pulling it from payroll.")
+    else:
+        e = f"They have {employees:,} people on payroll full time"
+        e += f" and bring on roughly {seasonal} more seasonally." if seasonal else "."
+        s.append(e)
+    if "location_count" in missing:
+        s.append("The client is still confirming the final list of sites.")
+    else:
+        s.append(f"They operate out of {locations} site{'s' if locations != 1 else ''}." if rng.random() < 0.5
+                 else f"Operations are spread over {locations} location{'s' if locations != 1 else ''}.")
+    if "total_insured_value" in missing:
+        s.append("Property values are being refreshed and will come over separately.")
+    else:
+        s.append(rng.choice([f"Total property values (buildings, contents and BI) come to {m(tiv)}.",
+                             f"All-in insured values are about {m(tiv)}."]))
+    if "gl_occurrence_limit" in missing:
+        s.append("On the GL they want to stay with the same limits as their current program.")
+    else:
+        s.append(f"On the GL they want {fmt_limit(gl)} per occurrence with a {fmt_limit(gl * 2)} aggregate.")
+    if "losses_5yr" in missing:
+        s.append("Loss runs are on order from the current carrier.")
+    elif losses == 0:
+        s.append("Loss history is clean: no claims in the last five years.")
+    else:
+        big = rng.randint(20, 300) * 1000
+        s.append(f"They've had {losses} claim{'s' if losses != 1 else ''} over the past five years, the largest about {fmt_money(big, 1)}.")
+    rng.shuffle(s)
+    if "effective_date" in missing:
+        timing = "Timing is flexible; there's no firm effective date yet."
+    else:
+        timing = f"Ideally we'd bind for {fmt_date(eff, rng.randint(0, 3))}."
+    lines = [f"Subject: Package opportunity: {name}",
+             f"From: {broker}, {agency}",
+             "To: Middle market submissions desk", "",
+             f"Hi all,", "",
+             f"Sending over {name} for a Package quote. They're {article} {desc} out of {state}. {timing}", "",
+             " ".join(s[:3]), "", " ".join(s[3:])]
+    if umbrella:
+        lines += ["", f"We'll handle the {fmt_limit(umbrella)} umbrella on its own."]
+    lines += ["", "Thanks,", first]
+    return "\n".join(lines)
+
+
 def main():
     used = set()
     study, keys = [], {}
     for i in range(1, 31):
         pid = f"S{i:02d}"
-        text, key = make_packet(pid, used)
-        study.append({"id": pid, "set": "study", "synthetic": True, "text": text})
+        style = "narrative" if i % 3 == 0 else "labeled"          # S03, S06, ... S30 are narrative
+        text, key = make_packet(pid, used, style=style)
+        study.append({"id": pid, "set": "study", "style": style, "synthetic": True, "text": text})
         keys[pid] = key
     practice = []
-    for pid, nmiss, inj in [("P1", 0, False), ("P2", 2, False), ("P3", 0, True)]:
-        text, key = make_packet(pid, used, n_missing=nmiss, injection=inj)
-        practice.append({"id": pid, "set": "practice", "synthetic": True, "text": text, "answer": key})
+    for pid, nmiss, inj, style in [("P1", 0, False, "labeled"), ("P2", 2, False, "narrative"), ("P3", 0, True, "labeled")]:
+        text, key = make_packet(pid, used, n_missing=nmiss, injection=inj, style=style)
+        practice.append({"id": pid, "set": "practice", "style": style, "synthetic": True, "text": text, "answer": key})
 
     root = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
     os.makedirs(os.path.join(root, "data"), exist_ok=True)
