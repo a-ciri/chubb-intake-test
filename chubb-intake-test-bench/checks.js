@@ -47,6 +47,7 @@
     const v = S.normalize(field, value);
     if (v === null) return false;
     if (field.type === "money" || field.type === "int") {
+      if (v === 0 && /\b(no|zero|none|nil)\b/i.test(quote)) return true;   // fix D2: "No claims reported" means 0
       return (String(quote).match(NUM_TOKEN) || []).some(tok => S.parseNumber(tok) === v);
     }
     if (field.type === "date") return (String(quote).match(DATE_TOKEN) || []).some(tok => S.parseDate(tok) === v);

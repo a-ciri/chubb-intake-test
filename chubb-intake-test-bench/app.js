@@ -453,14 +453,18 @@
         progressText.textContent = `${n} of 30 packets processed by the AI${state.running ? "…" : "."}`;
         bar.style.width = `${(n / 30) * 100}%`;
       },
-      done() { stopBtn.hidden = true; setRunLabel(); runBtn.disabled = false; renderResults(); }
+      done() { stopBtn.hidden = true; setRunLabel(); ui.progress(); renderResults(); }
     };
     function setRunLabel() {
       const n = okCount();
-      runBtn.textContent = n === 0 ? "Run benchmark on 30 packets" : n < 30 ? `Continue (${30 - n} left)` : "Benchmark complete";
-      runBtn.disabled = n === 30;
+      runBtn.textContent = n === 0 ? "Run benchmark on 30 packets" : n < 30 ? `Continue (${30 - n} left)` : "Run again (clears these results)";
+      runBtn.disabled = false;
     }
     runBtn.addEventListener("click", () => {
+      if (okCount() === 30) {
+        if (!window.confirm("Clear these results and run all 30 packets again? Download the CSV first if you need it.")) return;
+        state.bench = { results: {} }; save(); logBox.replaceChildren(); results.replaceChildren(); ui.progress();
+      }
       runBtn.disabled = true; stopBtn.hidden = false;
       runBenchmark(ui);
     });
